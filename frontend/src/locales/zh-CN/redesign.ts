@@ -5,8 +5,6 @@ export const redesign = {
     "clearFilters": "清除筛选",
     "selectVisible": "选择当前可见项",
     "loadedFileCount": "已加载 {{count}} 个文件",
-    "collapseFolders": "收起文件夹",
-    "expandFolders": "展开文件夹",
     "moveSingleOnly": "请选择一个文件或文件夹移动"
   },
   "tasks": {

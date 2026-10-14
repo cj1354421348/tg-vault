@@ -11,6 +11,7 @@ export interface TelegramAccountSchedulingCandidate {
     activeConnections: number;
     maxConnections: number;
     sourceAccessState: TelegramSourceAccessState;
+    lastSelected?: number;
 }
 
 export interface TelegramAccountSchedulingOptions {
@@ -21,8 +22,8 @@ export interface TelegramAccountSchedulingOptions {
 /**
  * Pure permission-aware weighted least-connections selection.
  * Known source access is preferred over an unprobed account. Within the same
- * access class, the lowest active/weight score wins. Priority and account id
- * make ties stable, which keeps retries and tests deterministic.
+ * access class, the lowest active/weight score wins. Equal-load accounts rotate
+ * by last selection, with priority and account id resolving initial ties.
  */
 export function selectWeightedLeastConnectedTelegramAccount<T extends TelegramAccountSchedulingCandidate>(
     candidates: readonly T[],
@@ -46,9 +47,17 @@ export function selectWeightedLeastConnectedTelegramAccount<T extends TelegramAc
         const leftLoad = (left.activeConnections + 1) / Math.max(Number.EPSILON, left.weight);
         const rightLoad = (right.activeConnections + 1) / Math.max(Number.EPSILON, right.weight);
         if (leftLoad !== rightLoad) return leftLoad - rightLoad;
+        const rotationDifference = (left.lastSelected || 0) - (right.lastSelected || 0);
+        if (rotationDifference) return rotationDifference;
         const priorityDifference = (right.priority || 0) - (left.priority || 0);
         if (priorityDifference) return priorityDifference;
         return left.accountId.localeCompare(right.accountId);
     });
     return runnable[0] || null;
+}
+
+export function normalizeTelegramAccountSourceKey(sourceKey: string): string {
+    const key = sourceKey.trim();
+    if (/^-100\d+$/.test(key)) return key.slice(4);
+    return /^@?[a-z\d_]+$/i.test(key) ? key.replace(/^@/, '').toLowerCase() : key;
 }

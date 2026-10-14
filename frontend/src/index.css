@@ -136,7 +136,7 @@
     font-size:14px;
   }
   input::placeholder, textarea::placeholder { color:hsl(var(--muted-foreground)); opacity:1; }
-  input:focus, select:focus, textarea:focus { border-color:hsl(var(--primary)); outline:0; box-shadow:0 0 0 3px hsl(var(--ring)/.18); }
+  input:focus, select:focus, textarea:focus { border-color:hsl(var(--primary)); outline:2px solid hsl(var(--ring)); outline-offset:2px; box-shadow:none; }
   input[type='checkbox'], input[type='radio'] { accent-color:hsl(var(--primary)); }
   select option, select optgroup { color:hsl(var(--popover-foreground)); background:hsl(var(--popover)); }
   button, a, input, select, textarea { -webkit-tap-highlight-color:transparent; }
@@ -197,6 +197,11 @@
     .indeterminate-spinner { animation:none; transform:rotate(-90deg); }
   }
 }
+
+/* Icon and select share one visible control boundary and one focus indicator. */
+:is(.tv-language, .tv-login-theme):focus-within { border-color:hsl(var(--primary)); outline:2px solid hsl(var(--ring)); outline-offset:2px; }
+:is(.tv-language, .tv-login-theme) > select { border:0; background:transparent; box-shadow:none; }
+:is(.tv-language, .tv-login-theme) > select:focus { outline:none; box-shadow:none; }
 
 /* Background choice is independent of the light/dark preference. */
 :root:not([data-background='mist']) {

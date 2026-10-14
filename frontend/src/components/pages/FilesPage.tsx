@@ -29,10 +29,6 @@ interface FilesPageProps {
     onCreateFolder: () => void;
     onNavigateFolder: (folder: string | null) => void;
     folders: FolderData[];
-    visibleFolders: FolderData[];
-    isFoldersExpanded: boolean;
-    showFolderToggle: boolean;
-    onToggleFolders: () => void;
     renderedFiles: FileData[];
     displayedFileCount: number;
     loading: boolean;
@@ -79,8 +75,7 @@ export const FilesPage = (props: FilesPageProps) => {
     const {
         currentCategory, currentFolder, searchQuery, onSearchChange, filterControl,
         onClearFilter, sortConfig, onSort, viewMode, onViewModeChange, onUpload,
-        onRefresh, onCreateFolder, onNavigateFolder, folders, visibleFolders,
-        isFoldersExpanded, showFolderToggle, onToggleFolders, renderedFiles,
+        onRefresh, onCreateFolder, onNavigateFolder, folders, renderedFiles,
         displayedFileCount, loading, initialEmpty, queryError, isStale, emptyKind,
         onOpenFolder, onRenameFolder, onFavoriteFolder, onMoveFolder, onDeleteFolder,
         onPreviewFile, onRenameFile, onFavoriteFile, onMoveFile, onDeleteFile,
@@ -93,11 +88,10 @@ export const FilesPage = (props: FilesPageProps) => {
         : (sortConfig.direction === 'asc' ? copy.dateAsc : copy.dateDesc);
     const [filtersOpen, setFiltersOpen] = useState(false);
     const filtersId = useId();
-    const foldersId = useId();
     const fileIds = new Set(selection.fileIds);
     const folderNames = new Set(selection.folderNames);
-    const visibleCount = renderedFiles.length + visibleFolders.length;
-    const selectedVisibleCount = renderedFiles.filter(file => fileIds.has(file.id)).length + visibleFolders.filter(folder => folderNames.has(folder.name)).length;
+    const visibleCount = renderedFiles.length + folders.length;
+    const selectedVisibleCount = renderedFiles.filter(file => fileIds.has(file.id)).length + folders.filter(folder => folderNames.has(folder.name)).length;
     const allVisibleSelected = visibleCount > 0 && visibleCount === selectedVisibleCount;
     const filterActive = currentCategory !== 'all' && currentCategory !== 'favorites';
     const filterLabel = i18n.language.startsWith('zh') ? '筛选与排序' : i18n.language.startsWith('ru') ? 'Фильтры и сортировка' : 'Filter & sort';
@@ -205,10 +199,9 @@ export const FilesPage = (props: FilesPageProps) => {
                             <section className="tv-files-folder-section">
                                 <div className="tv-files-section-heading">
                                     <h3><Folder aria-hidden="true" />{t('appCopy.folderLabel')}<span className="tv-badge">{folders.length}</span></h3>
-                                    {showFolderToggle && <Button variant="ghost" size="sm" aria-expanded={isFoldersExpanded} aria-controls={foldersId} onClick={onToggleFolders}>{t(isFoldersExpanded ? 'files.collapseFolders' : 'files.expandFolders')}{isFoldersExpanded ? <ChevronDown aria-hidden="true" /> : <ChevronRight aria-hidden="true" />}</Button>}
                                 </div>
-                                <div id={foldersId} className={viewMode === 'grid' ? 'tv-files-grid tv-folders-grid' : 'tv-folders-list'}>
-                                    {visibleFolders.map(folder => <FolderCard
+                                <div className={viewMode === 'grid' ? 'tv-files-grid tv-folders-grid' : 'tv-folders-list'}>
+                                    {folders.map(folder => <FolderCard
                                         key={folder.name} folder={folder} viewMode={viewMode}
                                         onClick={() => onOpenFolder(folder.name)} onRename={() => onRenameFolder(folder.name)}
                                         onToggleFavorite={() => onFavoriteFolder(folder.name)} onMove={() => onMoveFolder(folder.name)}

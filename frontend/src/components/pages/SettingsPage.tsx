@@ -22,6 +22,7 @@ import { Dialog } from "../ui/Dialog";
 import { getProviderMetadata } from '../../services/providerMetadata';
 import { LocalStorageLocation } from './LocalStorageLocation';
 import { TelegramUserAccountsPanel } from "./TelegramUserAccountsPanel";
+import { StorageAccountDetails } from './StorageAccountDetails';
 import { SettingsField, SettingsFormLayout, SettingsRow, SettingsSection, SettingsWorkspace } from "./SettingsPresentation";
 
 interface SettingsPageProps {
@@ -144,7 +145,7 @@ const ActionDialog = ({ state, input, onInput, onCancel, onConfirm }: {
                             value={input}
                             onChange={event => onInput(event.target.value)}
                             onKeyDown={event => { if (event.key === 'Enter') onConfirm(); }}
-                            className="mt-4 h-11 w-full rounded-lg border border-border bg-background px-3 outline-none focus:ring-2 focus:ring-primary/20"
+                            className="mt-4 h-11 w-full rounded-lg border border-border bg-background px-3"
                         />
                     )}
                 </div>
@@ -1396,7 +1397,7 @@ export const SettingsPage = ({ storageStats, onSignedOut, onOpenTasksForAccount,
                         <select
                             value={advancedTasks.telegramDownloadHistoryPolicy}
                             onChange={(event) => void updateAdvancedTask({ telegramDownloadHistoryPolicy: event.target.value as AdvancedTaskSettings['telegramDownloadHistoryPolicy'] }).catch((error: any) => showNotice(errorMessage(error) || t('settings.cards.maintenance.history.updateFailed'), t('settings.remaining.copy.139')))}
-                            className="h-10 w-full px-3 focus-visible:ring-2 focus-visible:ring-primary/40 sm:w-auto sm:min-w-48"
+                            className="h-10 w-full px-3 sm:w-auto sm:min-w-48"
                             aria-label={t('settings.cards.maintenance.history.policyLabel')}
                         >
                             <option value="errors_only">{t('settings.cards.maintenance.history.errorsOnly')}</option>
@@ -1450,15 +1451,11 @@ export const SettingsPage = ({ storageStats, onSignedOut, onOpenTasksForAccount,
                                     {telegramBotConfig?.source === 'environment' && <span className="rounded-full bg-blue-500/10 px-2 py-0.5 text-[11px] font-semibold text-primary">{t('settings.remaining.copy.022')}</span>}
                                     {telegramBotConfig?.source === 'web' && <span className="rounded-full bg-green-500/10 px-2 py-0.5 text-[11px] font-semibold settings-text-success">{t('settings.remaining.copy.023')}</span>}
                                 </div>
-                                <p className="mt-1 text-[12px] text-muted-foreground">{t('settings.remaining.copy.024')}</p>
                                 {telegramBotConfig?.configured && <div className="mt-2 text-[12px] leading-5 text-muted-foreground">
-                                    <p>{t('settings.remaining.copy.025')}</p>
                                     {telegramBotConfig.bot?.username && <p>Bot：@{telegramBotConfig.bot.username}</p>}
                                     <BotFaultDetails config={telegramBotConfig} />
                                     {telegramBotConfig.enabled && telegramBotConfig.status !== 'ready' && <p>{t('settings.remaining.shared.runtimeNotReady')}</p>}
-                                    {telegramBotConfig.checkedAt && <p>{t('settings.botConnection.checkedAt')}: {formatDateTime(telegramBotConfig.checkedAt, i18n.resolvedLanguage || i18n.language)}</p>}
                                     {telegramBotConfig.nextRetryAt && telegramBotConfig.enabled && <p>{t('settings.botConnection.nextRetryAt')}: {formatDateTime(telegramBotConfig.nextRetryAt, i18n.resolvedLanguage || i18n.language)}</p>}
-                                    {telegramBotConfig.retryAttempt != null && <p>{t('settings.botConnection.retryAttempt')}: {formatNumber(telegramBotConfig.retryAttempt, i18n.resolvedLanguage || i18n.language)}</p>}
                                 </div>}
                             </div>
                         </div>
@@ -1467,6 +1464,7 @@ export const SettingsPage = ({ storageStats, onSignedOut, onOpenTasksForAccount,
                             {telegramBotConfig?.source === 'web' && <div className="settings-actions settings-actions--bot">
                                 <Button size="sm" variant="outline" className="settings-action" disabled={isSavingTelegramBot} onClick={() => { if (showTelegramBotForm) handleCancelTelegramBotEdit(); else { handleCancelTelegramPinChange(); clearTelegramBotInputs(); setShowTelegramBotForm(true); } }}>{showTelegramBotForm ? t('settings.remaining.copy.326') : t('settings.remaining.copy.327')}</Button>
                                 <Button size="sm" variant="outline" className="settings-action" disabled={isChangingTelegramPin} onClick={() => { if (showTelegramPinForm) handleCancelTelegramPinChange(); else { handleCancelTelegramBotEdit(); clearTelegramPinChangeInputs(); setTelegramPinVerificationMethod(telegramBotConfig.pinConfigured ? 'current_pin' : 'web_password'); setShowTelegramPinForm(true); } }}>{showTelegramPinForm ? (telegramBotConfig.pinConfigured ? t('settings.remaining.copy.322') : t('settings.remaining.copy.323')) : (telegramBotConfig.pinConfigured ? t('settings.remaining.copy.324') : t('settings.remaining.copy.325'))}</Button>
+                                <Button size="sm" variant="outline" className="settings-action" disabled={isRefreshingBot || isRetryingBot || isSavingTelegramBot} onClick={() => setBotPollEpoch(value => value + 1)}>{t(isRefreshingBot ? 'settings.botConnection.refreshing' : 'settings.botConnection.refresh')}</Button>
                                 <Button size="sm" variant="destructive" className="settings-action" onClick={handleDeleteTelegramBot} disabled={isSavingTelegramBot}>{t('settings.remaining.copy.027')}</Button>
                             </div>}
                         </div>
@@ -1474,20 +1472,18 @@ export const SettingsPage = ({ storageStats, onSignedOut, onOpenTasksForAccount,
                         {!telegramBotConfig?.pinConfigured && telegramBotConfig?.source === 'environment' && <SettingsField label={t('settings.remaining.copy.029')} className="mt-4"><input type="password" inputMode="numeric" pattern="[0-9]{4}" maxLength={4} autoComplete="new-password" value={telegramPin} onChange={event => setTelegramPin(event.target.value.replace(/\D/g, '').slice(0, 4))} placeholder={t('settings.remaining.shared.createPinBeforeMigration')} className="w-full px-3 py-2" /><p className="text-[12px] text-muted-foreground">{t('settings.remaining.copy.030')}</p></SettingsField>}
                     </div>
 
-                    <div className="space-y-2" data-testid="bot-runtime-controls">
+                    {(telegramBotConfig?.source !== 'web' || (telegramBotConfig?.enabled && telegramBotConfig.status !== 'ready') || telegramBotConfig?.busy || telegramBotConfig?.retryAllowedAt || botStatusError || botRetryError) && <div className="space-y-2" data-testid="bot-runtime-controls">
                         <div className="flex flex-wrap gap-2">
                             {telegramBotConfig?.configured && telegramBotConfig.enabled && telegramBotConfig.status !== 'ready' && <Button size="sm" onClick={handleRetryTelegramBot} disabled={botRetryBlocked || isRetryingBot || isSavingTelegramBot || isChangingTelegramPin}>{t(isRetryingBot ? 'settings.botConnection.retrying' : 'settings.botConnection.retry')}</Button>}
-                            <Button size="sm" variant="outline" disabled={isRefreshingBot || isRetryingBot || isSavingTelegramBot} onClick={() => setBotPollEpoch(value => value + 1)}>{t(isRefreshingBot ? 'settings.botConnection.refreshing' : 'settings.botConnection.refresh')}</Button>
+                            {telegramBotConfig?.source !== 'web' && <Button size="sm" variant="outline" disabled={isRefreshingBot || isRetryingBot || isSavingTelegramBot} onClick={() => setBotPollEpoch(value => value + 1)}>{t(isRefreshingBot ? 'settings.botConnection.refreshing' : 'settings.botConnection.refresh')}</Button>}
                         </div>
-                        <p className="settings-help">{t('settings.botConnection.scope')}</p>
-                        <p className="settings-help">{t('settings.botConnection.polling')}</p>
                         <div aria-live="polite">
                             {telegramBotConfig?.busy && <p className="text-sm">{t('settings.botConnection.busy')}</p>}
                             {telegramBotConfig?.retryAllowedAt && <p className="text-sm">{t('settings.botConnection.retryAllowedAt')}: {formatDateTime(telegramBotConfig.retryAllowedAt, i18n.resolvedLanguage || i18n.language)}</p>}
                             {botStatusError && <p className="text-destructive text-sm">{t('settings.botConnection.refreshFailed')}</p>}
                             {botRetryError && <p className="text-destructive text-sm">{botRetryError}</p>}
                         </div>
-                    </div>
+                    </div>}
 
                     {(!telegramBotConfig?.configured || showTelegramBotForm) && <SettingsFormLayout guide={<p className="settings-help">{t('settings.botConnection.probeHelp')}</p>}>
                         <div className="settings-form-grid">
@@ -1712,7 +1708,7 @@ export const SettingsPage = ({ storageStats, onSignedOut, onOpenTasksForAccount,
                                     )} />
                                     <div className="min-w-0 flex-1">
                                         <p className="text-[13px] font-medium">{account.name || t('settings.remaining.copy.363')}</p>
-                                        <details className="settings-account-details"><summary>{t('uiAudit.details')}</summary><code>{account.id}</code></details>
+                                        <StorageAccountDetails account={account} onSaved={reloadStorageConfig} />
                                         <StorageProbeStatus account={account} busy={probingAccountId === account.id} feedback={probeFeedback?.accountId === account.id ? probeFeedback : null} onProbe={() => void handleProbeAccount(account)} />
                                     </div>
                                 </div>
@@ -1886,7 +1882,7 @@ export const SettingsPage = ({ storageStats, onSignedOut, onOpenTasksForAccount,
                                     )} />
                                     <div className="min-w-0 flex-1">
                                         <p className="text-[13px] font-medium">{account.name || t('settings.remaining.copy.363')}</p>
-                                        <details className="settings-account-details"><summary>{t('uiAudit.details')}</summary><code>{account.id}</code></details>
+                                        <StorageAccountDetails account={account} onSaved={reloadStorageConfig} />
                                         <StorageProbeStatus account={account} busy={probingAccountId === account.id} feedback={probeFeedback?.accountId === account.id ? probeFeedback : null} onProbe={() => void handleProbeAccount(account)} />
                                     </div>
                                 </div>
@@ -2065,7 +2061,7 @@ export const SettingsPage = ({ storageStats, onSignedOut, onOpenTasksForAccount,
                                     )} />
                                     <div className="min-w-0 flex-1">
                                         <p className="text-[13px] font-medium">{account.name || t('settings.remaining.copy.363')}</p>
-                                        <details className="settings-account-details"><summary>{t('uiAudit.details')}</summary><code>{account.id}</code></details>
+                                        <StorageAccountDetails account={account} onSaved={reloadStorageConfig} />
                                         <StorageProbeStatus account={account} busy={probingAccountId === account.id} feedback={probeFeedback?.accountId === account.id ? probeFeedback : null} onProbe={() => void handleProbeAccount(account)} />
                                     </div>
                                 </div>
@@ -2245,7 +2241,7 @@ export const SettingsPage = ({ storageStats, onSignedOut, onOpenTasksForAccount,
                                     )} />
                                     <div className="min-w-0 flex-1">
                                         <p className="text-[13px] font-medium">{account.name || t('settings.remaining.copy.363')}</p>
-                                        <details className="settings-account-details"><summary>{t('uiAudit.details')}</summary><code>{account.id}</code></details>
+                                        <StorageAccountDetails account={account} onSaved={reloadStorageConfig} />
                                         <StorageProbeStatus account={account} busy={probingAccountId === account.id} feedback={probeFeedback?.accountId === account.id ? probeFeedback : null} onProbe={() => void handleProbeAccount(account)} />
                                     </div>
                                 </div>
@@ -2445,7 +2441,7 @@ export const SettingsPage = ({ storageStats, onSignedOut, onOpenTasksForAccount,
                                     )} />
                                     <div className="min-w-0 flex-1">
                                         <p className="text-[13px] font-medium">{account.name || t('settings.remaining.copy.363')}</p>
-                                        <details className="settings-account-details"><summary>{t('uiAudit.details')}</summary><code>{account.id}</code></details>
+                                        <StorageAccountDetails account={account} onSaved={reloadStorageConfig} />
                                         <StorageProbeStatus account={account} busy={probingAccountId === account.id} feedback={probeFeedback?.accountId === account.id ? probeFeedback : null} onProbe={() => void handleProbeAccount(account)} />
                                     </div>
                                 </div>
@@ -2598,7 +2594,7 @@ export const SettingsPage = ({ storageStats, onSignedOut, onOpenTasksForAccount,
                             <div key={account.id} className={cn("flex flex-col gap-3 rounded-[7px] border p-3 sm:flex-row sm:items-center sm:justify-between", account.is_active ? "border-primary/20 bg-primary/5" : "border-border bg-background")}>
                                 <div className="min-w-0">
                                     <p className="text-[13px] font-medium">{account.name || t('settings.openlist.unnamed')}</p>
-                                    <details className="settings-account-details"><summary>{t('uiAudit.details')}</summary><code>{account.id}</code></details>
+                                    <StorageAccountDetails account={account} onSaved={reloadStorageConfig} />
                                     <StorageProbeStatus account={account} busy={probingAccountId === account.id} feedback={probeFeedback?.accountId === account.id ? probeFeedback : null} onProbe={() => void handleProbeAccount(account)} />
                                 </div>
                                 <div className="flex items-center justify-end gap-2">

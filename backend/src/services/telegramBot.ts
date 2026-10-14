@@ -9,18 +9,20 @@ import crypto from 'crypto';
 import { storageManager, type StorageTargetSnapshot } from '../services/storage.js';
 import { passwordInputState, isAuthenticatedAsync, loadAuthenticatedUsers, persistAuthenticatedUser, revokeAuthenticatedUser, reconcileTelegramAllowedUsers, userStates, TelegramUserState } from './telegramState.js';
 import { buildSecurityLoginNotification, type TelegramLoginDetails } from './telegramLoginNotification.js';
-import { buildProgressControlButtons, registerProgressCard, isInteractiveProgressCard } from './telegramProgressControls.js';
-import { channelTaskCenterItem } from './telegramTaskCenter.js';
+import { registerProgressCard } from './telegramProgressControls.js';
 import { is2FAEnabled, generateOTPAuthUrl, verifyTOTP, activate2FA } from '../utils/security.js';
-import { handleStart, handleHelp, handleNotifications, handleNotificationsCallback, handleStatus, handleStorage, handleStorageSwitch, handleStorageSwitchCallback, handleTarget, handleTargetCallback, handleFind, handleList, handleDelete, handleDeleteConfirmCallback, handleTelegramFileBrowserCallback, applyPendingTelegramFileMutation, handleTasks, handleTaskCenterCallback, handleBulkTaskCancelCallback, handleStopTasks, handlePauseTasks, handleResumeTasks, handleCancelTask, handleChannelTaskQueueCallback, handleRetryFailedTasks, handleDownloadWorkers, handleDownloadWorkersCallback, handleFileConcurrency, handleFileConcurrencyCallback, handleStorageCleanupCallback, handlePathRules, handlePathOnce, handlePathSession, handlePathClear, handlePathRulesCallback, handleDuplicateMode, handleDuplicateModeCallback, handleCleanupSettings, handleCleanupSettingsCallback } from './telegramCommands.js';
-import { handleFileUpload, handleCleanupCallback, pauseDownloadTasks, resumeDownloadTasks, resolveTaskChatIdForControl, refreshSilentProgress, cancelSilentTask, canControlTask, listFailedDownloadTaskDetails, retryFailedDownloadTasks, loadFileDownloadConcurrencySetting } from './telegramUpload.js';
+import { handleStart, handleHelp, handleNotifications, handleNotificationsCallback, handleStatus, handleStorage, handleStorageSwitch, handleStorageSwitchCallback, handleTarget, handleTargetCallback, handleDelete, handleDeleteConfirmCallback, handleTelegramFileBrowserCallback, applyPendingTelegramFileMutation, handleTasks, handleTaskCenterCallback, handleBulkTaskCancelCallback, handleStopTasks, handlePauseTasks, handleResumeTasks, handleCancelTask, handleChannelTaskQueueCallback, handleRetryFailedTasks, handleDownloadWorkers, handleDownloadWorkersCallback, handleFileConcurrency, handleFileConcurrencyCallback, handleStorageCleanupCallback, handlePathRules, handlePathOnce, handlePathSession, handlePathClear, handlePathRulesCallback, handleDuplicateMode, handleDuplicateModeCallback, handleCleanupSettings, handleCleanupSettingsCallback } from './telegramCommands.js';
+import { handleFileUpload, handleCleanupCallback, pauseDownloadTasks, resumeDownloadTasks, resolveTaskChatIdForControl, refreshSilentProgress, cancelSilentTask, canControlTask, getTaskControlJobIds, listFailedDownloadTaskDetails, retryFailedDownloadTasks, loadFileDownloadConcurrencySetting } from './telegramUpload.js';
 
 import { enqueueTelegramNotification, flushTelegramNotificationDigest, listTelegramNotificationDigestScopes, resolveNotificationOwnerUserId } from './telegramNotificationDelivery.js';
-import { DEFAULT_LOCALE, TELEGRAM_LOCALES, t, type TelegramLocale } from '../i18n/telegram.js';
+import { getTaskReceipt, taskReceiptFailures } from './telegramTaskReceipts.js';
+import { DEFAULT_LOCALE, TELEGRAM_LOCALES, formatBytes, t, type TelegramLocale } from '../i18n/telegram.js';
 import { getTelegramUserLocale, getTelegramUserLocaleOrDefault, setTelegramUserLocale } from './telegramLocalePreferences.js';
 import {
     enqueueTelegramDateDownload,
     enqueueTelegramTagDownload,
+    validateTelegramSourceInput,
+    normalizeHashtag,
     findTelegramSubscription,
     listTelegramSubscriptions,
     type TelegramJobProgressSummary,
@@ -37,13 +39,14 @@ import {
     retryTelegramBackgroundJob,
     TELEGRAM_COMMENTS_MAX_PER_POST,
 } from './telegramChannelJobs.js';
-import { buildStartPrompt, buildAuthSuccess, build2FASetupCaption, buildHelp } from '../utils/telegramMessages.js';
+import { buildStartPrompt, buildAuthSuccess, build2FASetupCaption, buildHelp, getProviderDisplayName } from '../utils/telegramMessages.js';
 import { query } from '../db/index.js';
 import { getConfiguredTelegramAllowedUsers, addTelegramAllowedUser, countAuthenticatedTelegramUsers, shouldAutoAllowFirstTelegramUser, verifyTelegramPin } from '../utils/authSettings.js';
 import { assertPublicHttpUrl } from '../utils/networkSecurity.js';
-import { consumeOrGetTelegramTargetState } from '../utils/telegramTargetStateStore.js';
+import { peekTelegramTargetState, consumeConfirmedTelegramTargetState, type TelegramTargetSelection } from '../utils/telegramTargetStateStore.js';
+import { cancelTelegramWizard, submitTelegramWizard, type TelegramWizardSubmissionState } from './telegramWizardSubmission.js';
 import { BOT_COMMANDS, buildBotCommandMenu, normalizeBotCommandText } from '../utils/telegramCommandRegistry.js';
-import { rememberRecentTelegramPathPersistent, buildPathPreviewLine, applyPendingTelegramPathInputPersistent, getPendingTelegramPathInput, clearPendingTelegramPathInput } from '../utils/telegramPathSettings.js';
+import { sanitizeCustomStoragePath, rememberRecentTelegramPathPersistent, buildPathPreviewLine, applyPendingTelegramPathInputPersistent, getPendingTelegramPathInput, clearPendingTelegramPathInput } from '../utils/telegramPathSettings.js';
 import { isTelegramSubscriptionVisibleInManagement } from './telegramSubscriptionVisibility.js';
 import { buildTelegramSubscriptionPage, buildSubscriptionOperations, parseTelegramSubscriptionCallback } from './telegramSubscriptionManagement.js';
 import { parseDateOnlyStrict, parseTelegramDateRange } from './telegramDateRange.js';
@@ -114,12 +117,12 @@ async function handleBotHomeCallback(update: Api.UpdateBotCallbackQuery, data: s
     if (data === 'home_tasks' || data === 'home_open_tasks') return handleTasks(await currentMessage(), locale);
     if (data === 'home_storage' || data === 'home_open_storage') return handleStorage(await currentMessage(), locale);
     if (data === 'home_upload') {
-        await client!.editMessage(update.peer, { message: Number(update.msgId), text: t(locale, 'bot.home.uploadHint'), buttons: new Api.ReplyInlineMarkup({ rows: [] }) });
+        await client!.editMessage(update.peer, { message: Number(update.msgId), text: t(locale, 'bot.home.uploadHint'), buttons: undefined });
         return;
     }
     const pageMatch = data.match(/^home_page_(\d+)$/);
     if (data === 'home_more' || pageMatch) {
-        await client!.editMessage(update.peer, { message: Number(update.msgId), text: buildHelp(locale), buttons: new Api.ReplyInlineMarkup({ rows: [] }) });
+        await client!.editMessage(update.peer, { message: Number(update.msgId), text: buildHelp(locale), buttons: undefined });
         return;
     }
     const openMatch = data.match(/^home_open_([a-z0-9_]+)$/);
@@ -137,8 +140,6 @@ async function handleBotHomeCallback(update: Api.UpdateBotCallbackQuery, data: s
         await message.reply({ message: buildSubscriptionManagePanel(rows, 0, locale), buttons: buildSubscriptionActionKeyboard(rows, 0, locale) });
         return;
     }
-    if (command === 'list') return handleList(message, [], locale);
-    if (command === 'find') return handleFind(message, [], locale);
     if (command === 'status') return handleStatus(message, locale);
     if (command === 'notifications') return handleNotifications(message, [], locale);
     if (command === 'tasks') return handleTasks(message, locale);
@@ -222,9 +223,9 @@ function scheduleBotRetry(error: unknown): void {
 }
 
 type TelegramWizardKind = 'tg_sub_manage' | 'tg_download' | 'tg_date' | 'tg_tag';
-type TelegramWizardStep = 'mode' | 'source' | 'path' | 'comments' | 'start_date' | 'end_date' | 'tag' | 'confirm';
+type TelegramWizardStep = 'mode' | 'source' | 'path' | 'start_date' | 'end_date' | 'tag' | 'confirm';
 
-interface TelegramWizardState {
+interface TelegramWizardState extends TelegramWizardSubmissionState {
     kind: TelegramWizardKind;
     step: TelegramWizardStep;
     source?: string;
@@ -234,6 +235,9 @@ interface TelegramWizardState {
     dayCount?: number;
     requiresLargeRangeConfirmation?: boolean;
     target?: StorageTargetSnapshot;
+    targetSelection?: TelegramTargetSelection | null;
+    editing?: boolean;
+    processing?: boolean;
     targetProvider?: string;
     targetAccountId?: string | null;
     targetAccountName?: string;
@@ -261,20 +265,44 @@ function buildTelegramDownloadModeKeyboard(locale: TelegramLocale = DEFAULT_LOCA
     });
 }
 
-function buildTelegramCommentsKeyboard(locale: TelegramLocale = DEFAULT_LOCALE): Api.ReplyInlineMarkup {
+function buildTelegramDownloadConfirmKeyboard(state: TelegramWizardState, locale: TelegramLocale = DEFAULT_LOCALE): Api.ReplyInlineMarkup {
     return new Api.ReplyInlineMarkup({
         rows: [
             new Api.KeyboardButtonRow({
                 buttons: [
-                    new Api.KeyboardButtonCallback({ text: t(locale, 'bot.button.channelOnly'), data: Buffer.from('tgd_comments_off') }),
-                    new Api.KeyboardButtonCallback({ text: t(locale, 'bot.button.channelComments'), data: Buffer.from('tgd_comments_on') }),
+                    new Api.KeyboardButtonCallback({ text: `${!state.includeComments ? '● ' : ''}${t(locale, 'bot.button.channelOnly')}`, data: Buffer.from('tgd_comments_off') }),
+                    new Api.KeyboardButtonCallback({ text: `${state.includeComments ? '● ' : ''}${t(locale, 'bot.button.channelComments')}`, data: Buffer.from('tgd_comments_on') }),
                 ],
             }),
+            new Api.KeyboardButtonRow({ buttons: [
+                new Api.KeyboardButtonCallback({ text: t(locale, 'bot.wizard.editSource'), data: Buffer.from('tgd_edit_source') }),
+                new Api.KeyboardButtonCallback({ text: t(locale, state.kind === 'tg_tag' ? 'bot.wizard.editTag' : 'bot.wizard.editDates'), data: Buffer.from('tgd_edit_filter') }),
+                new Api.KeyboardButtonCallback({ text: t(locale, 'bot.wizard.editFolder'), data: Buffer.from('tgd_edit_path') }),
+            ] }),
             new Api.KeyboardButtonRow({
-                buttons: [new Api.KeyboardButtonCallback({ text: t(locale, 'common.cancel'), data: Buffer.from('tgd_cancel') })],
+                buttons: [
+                    new Api.KeyboardButtonCallback({ text: t(locale, 'common.confirm'), data: Buffer.from('tgd_confirm') }),
+                    new Api.KeyboardButtonCallback({ text: t(locale, 'common.cancel'), data: Buffer.from('tgd_cancel') }),
+                ],
             }),
         ],
     });
+}
+
+function buildTelegramWizardKeyboard(state: TelegramWizardState, locale: TelegramLocale): Api.ReplyInlineMarkup {
+    if (state.step === 'mode') return buildTelegramDownloadModeKeyboard(locale);
+    if (state.step === 'confirm') return buildTelegramDownloadConfirmKeyboard(state, locale);
+    const buttons = state.step === 'path' ? [new Api.KeyboardButtonCallback({
+        text: t(locale, 'bot.wizard.defaultFolderButton'), data: Buffer.from('tgd_default_path'),
+    })] : [];
+    buttons.push(new Api.KeyboardButtonCallback({ text: t(locale, 'common.cancel'), data: Buffer.from('tgd_cancel') }));
+    return new Api.ReplyInlineMarkup({ rows: [new Api.KeyboardButtonRow({ buttons })] });
+}
+
+async function sendTelegramWizardPrompt(message: Api.Message, userId: number, chatKey: string, state: TelegramWizardState, locale: TelegramLocale): Promise<void> {
+    if (telegramWizardStates.get(userId, chatKey)?.value !== state) return;
+    const reply = await message.reply({ message: buildTelegramWizardPrompt(state, locale), buttons: buildTelegramWizardKeyboard(state, locale), linkPreview: false });
+    if (telegramWizardStates.get(userId, chatKey)?.value === state) refreshTelegramWizardState(userId, chatKey, state, (reply as Api.Message).id);
 }
 
 const TELEGRAM_INTERACTION_TTL_MS = Math.max(60_000, parseInt(process.env.TELEGRAM_INTERACTION_TTL_MS || '900000', 10) || 900_000);
@@ -441,12 +469,6 @@ function buildTelegramWizardPrompt(state: TelegramWizardState, locale: TelegramL
         return t(locale, 'bot.wizard.path', { title, source: state.subscriptionSource || state.source, scope });
     }
 
-    if (state.step === 'comments') {
-        const folder = state.customFolder
-            ? t(locale, 'bot.wizard.folder.custom', { folder: state.customFolder })
-            : t(locale, 'bot.wizard.folder.default');
-        return t(locale, 'bot.wizard.comments', { title, source: state.subscriptionSource || state.source, folder, count: state.commentsMaxPerPost || TELEGRAM_COMMENTS_MAX_PER_POST });
-    }
 
     if (state.step === 'confirm') {
         const range = state.kind === 'tg_tag'
@@ -462,7 +484,7 @@ function buildTelegramWizardPrompt(state: TelegramWizardState, locale: TelegramL
             ...dateRangeLines,
             t(locale, 'bot.wizard.confirmComments', { value: state.includeComments ? t(locale, 'bot.wizard.confirmCommentsOn', { count: state.commentsMaxPerPost }) : t(locale, 'bot.wizard.confirmCommentsOff') }),
             t(locale, 'bot.wizard.confirmFolder', { folder: state.customFolder || t(locale, 'bot.wizard.folder.defaultValue') }),
-            t(locale, 'bot.wizard.confirmStorage', { provider: state.targetProvider || t(locale, 'bot.wizard.storage.current'), account: state.targetAccountName || state.targetAccountId || t(locale, 'bot.wizard.storage.currentAccount') }),
+            t(locale, 'bot.wizard.confirmStorage', { provider: state.targetProvider === 'local' ? t(locale, 'commands.localStorage') : state.targetProvider ? getProviderDisplayName(state.targetProvider) : t(locale, 'bot.wizard.storage.current'), account: state.targetAccountName || t(locale, 'bot.wizard.storage.currentAccount') }),
             '', t(locale, 'bot.wizard.confirmNote'),
             t(locale, 'bot.wizard.confirmInput')].join('\n');
     }
@@ -488,107 +510,6 @@ function isDateOnly(text: string): boolean {
 }
 
 
-interface TelegramDownloadScanSummary {
-    source: string;
-    mode: 'date' | 'tag';
-    channelMessagesScanned: number;
-    channelMediaFound: number;
-    commentMessagesScanned: number;
-    commentMediaFound: number;
-    totalMediaFound: number;
-    commentsEnabled: boolean;
-    commentsMaxPerPost: number;
-}
-
-export function buildLegacyJobProgressPresentation(summary: TelegramJobProgressSummary, locale: TelegramLocale = DEFAULT_LOCALE): string {
-    const totalDone = summary.completed + summary.failed + summary.skipped;
-    const cooldownIsFloodWait = summary.status === 'cooling' && /floodwait/i.test((summary as TelegramJobProgressSummary & { error?: string }).error || '');
-    const title = summary.status === 'paused'
-        ? t(locale, 'bot.legacy.pausedTitle')
-        : summary.status === 'cooling'
-            ? (cooldownIsFloodWait ? t(locale, 'bot.legacy.floodWaitTitle') : t(locale, 'bot.legacy.storageCooldownTitle'))
-            : summary.status === 'cancelled'
-                ? t(locale, 'bot.legacy.cancelledTitle')
-                : totalDone >= summary.totalMediaFound && summary.scanStatus === 'done'
-                    ? t(locale, 'bot.legacy.completedTitle')
-                    : t(locale, 'bot.legacy.runningTitle');
-    const controls = summary.status === 'paused'
-        ? t(locale, 'bot.legacy.controlsPaused')
-        : summary.status === 'cooling' || summary.status === 'cancelled'
-            ? ''
-            : t(locale, 'bot.legacy.controlsActive');
-    return [
-        title,
-        t(locale, 'bot.legacy.job', { jobId: summary.jobId.slice(0, 12) }),
-        t(locale, 'bot.legacy.source', { source: summary.source || t(locale, 'status.state.unknown') }),
-        ``,
-        t(locale, 'bot.legacy.scan', { status: summary.scanStatus || 'pending' }),
-        t(locale, 'bot.legacy.channelScan', { scanned: summary.channelMessagesScanned || 0, found: summary.channelMediaFound || 0 }),
-        t(locale, 'bot.legacy.commentScan', { scanned: summary.commentMessagesScanned || 0, found: summary.commentMediaFound || 0 }),
-        ``,
-        t(locale, 'bot.legacy.download', { status: summary.downloadStatus }),
-        t(locale, 'bot.legacy.counts', { completed: summary.completed || 0, pending: summary.pending || 0, downloading: summary.downloading || 0, failed: summary.failed || 0, skipped: summary.skipped || 0 }),
-        summary.cooldownUntil ? t(locale, cooldownIsFloodWait ? 'bot.legacy.floodWait' : 'bot.legacy.storageCooldown', { until: summary.cooldownUntil }) : '',
-        controls,
-    ].filter(Boolean).join('\n');
-}
-
-async function updateJobProgressMessage(statusMessage: Api.Message, summary: TelegramJobProgressSummary, locale: TelegramLocale = DEFAULT_LOCALE, ownerId?: number): Promise<void> {
-    const chatId = statusMessage.chatId?.toString();
-    if (!chatId || ownerId === undefined || isInteractiveProgressCard(chatId, statusMessage.id)) return;
-    const terminal = ['completed', 'done', 'cancelled', 'failed'].includes(summary.status)
-        || (summary.scanStatus === 'done' && summary.pending === 0 && summary.downloading === 0
-            && summary.completed + summary.failed + summary.skipped >= summary.totalMediaFound);
-    const item = terminal ? null : channelTaskCenterItem({
-        id: summary.jobId, status: summary.status, scan_status: summary.scanStatus,
-        download_status: summary.downloadStatus, source: summary.source,
-        total_count: summary.totalMediaFound, downloading_count: summary.downloading,
-        pending_count: summary.pending, success_count: summary.completed,
-        failed_count: summary.failed, skipped_count: summary.skipped,
-        cooldown_until: summary.cooldownUntil,
-    }, locale);
-    registerProgressCard(chatId, statusMessage.id, ownerId);
-    await statusMessage.edit({
-        text: buildLegacyJobProgressPresentation(summary, locale),
-        buttons: buildProgressControlButtons(item ? [item] : [], locale),
-    }).catch(() => undefined);
-}
-
-async function updateScanStatusMessage(statusMessage: Api.Message, summary: TelegramDownloadScanSummary, locale: TelegramLocale = DEFAULT_LOCALE): Promise<void> {
-    const lines = [
-        t(locale, 'bot.legacy.scanComplete'),
-        t(locale, 'bot.legacy.source', { source: summary.source }),
-        ``,
-        t(locale, 'bot.legacy.channelScanned', { scanned: summary.channelMessagesScanned, found: summary.channelMediaFound }),
-        summary.commentsEnabled
-            ? t(locale, 'bot.legacy.commentsScanned', { scanned: summary.commentMessagesScanned, found: summary.commentMediaFound, max: summary.commentsMaxPerPost })
-            : t(locale, 'bot.legacy.commentsDisabled'),
-        t(locale, 'bot.legacy.pending', { count: summary.totalMediaFound }),
-        ``,
-        t(locale, 'bot.legacy.queueing'),
-    ];
-    await statusMessage.edit({ text: lines.join('\n') }).catch(() => undefined);
-}
-
-async function replyWithJobResult(statusMessage: Api.Message, fallbackMessage: Api.Message, promise: Promise<any>, kind: 'date' | 'tag', locale: TelegramLocale = DEFAULT_LOCALE): Promise<void> {
-    promise
-        .then(result => {
-            const cancelled = Boolean(result.cancelled);
-            const commentLine = result.commentMediaFound || result.commentMessagesScanned
-                ? `\n${t(locale, 'bot.legacy.commentLine', { scanned: result.commentMessagesScanned || 0, found: result.commentMediaFound || 0 })}`
-                : '';
-            const text = cancelled
-                ? t(locale, 'bot.legacy.cancelledResult', { mode: t(locale, kind === 'tag' ? 'bot.wizard.modeTag' : 'bot.wizard.modeDate'), jobId: String(result.jobId).slice(0, 12), successful: result.successful || 0, skipped: result.skipped || 0, commentLine })
-                : kind === 'tag'
-                    ? t(locale, 'bot.legacy.tagResult', { tag: result.tag, jobId: String(result.jobId).slice(0, 12), found: result.found, skipped: result.skipped, failed: result.failed, commentLine })
-                    : t(locale, 'bot.legacy.dateResult', { jobId: String(result.jobId).slice(0, 12), found: result.found, skipped: result.skipped, failed: result.failed, commentLine });
-            statusMessage.edit({ text }).catch(() => fallbackMessage.reply({ message: text }).catch(() => undefined));
-        })
-        .catch(error => {
-            const text = t(locale, 'bot.legacy.failed', { mode: kind === 'tag' ? t(locale, 'bot.wizard.modeTag') : t(locale, 'bot.wizard.modeDate'), error: error instanceof Error ? error.message : String(error) });
-            statusMessage.edit({ text }).catch(() => fallbackMessage.reply({ message: text }).catch(() => undefined));
-        });
-}
 
 async function startTelegramWizard(message: Api.Message, senderId: number, kind: TelegramWizardKind): Promise<void> {
     const locale = await getTelegramUserLocaleOrDefault(senderId);
@@ -605,13 +526,13 @@ async function startTelegramWizard(message: Api.Message, senderId: number, kind:
     }
     const reply = await message.reply({
         message: buildTelegramWizardPrompt(state, locale),
-        buttons: kind === 'tg_download' ? buildTelegramDownloadModeKeyboard(locale) : undefined,
+        buttons: buildTelegramWizardKeyboard(state, locale),
     });
     originMessageId = (reply as Api.Message).id;
     putTelegramWizardState(senderId, chatKey, state, originMessageId);
 }
 
-async function handleTelegramWizardMessage(message: Api.Message, senderId: number, text: string): Promise<boolean> {
+async function handleTelegramWizardMessage(message: Api.Message, senderId: number, text: string, callbackMessageId?: number, callbackStep?: TelegramWizardStep): Promise<boolean> {
     const locale = await getTelegramUserLocaleOrDefault(senderId);
     const chatKey = messageChatKey(message, senderId);
     const lookup = telegramWizardStates.lookup(senderId, chatKey);
@@ -621,6 +542,15 @@ async function handleTelegramWizardMessage(message: Api.Message, senderId: numbe
     }
     if (lookup.status === 'missing') return false;
     const state = lookup.record.value;
+    if (callbackMessageId !== undefined && (lookup.record.originMessageId !== callbackMessageId || state.step !== callbackStep)) return true;
+    const replyToId = message.replyTo instanceof Api.MessageReplyHeader ? message.replyTo.replyToMsgId : undefined;
+    if (callbackMessageId === undefined && replyToId && replyToId !== lookup.record.originMessageId) {
+        await message.reply({ message: t(locale, 'bot.wizard.callbackExpired') });
+        return true;
+    }
+    if (state.processing || state.submitting || state.createdJobId || state.cancelling || state.cancelled) return true;
+    state.processing = true;
+    try {
 
     const input = text.trim();
     if (!input) return true;
@@ -643,7 +573,7 @@ async function handleTelegramWizardMessage(message: Api.Message, senderId: numbe
             await message.reply({ message: t(locale, 'bot.wizard.invalidMode') });
             return true;
         }
-        await message.reply({ message: buildTelegramWizardPrompt(state, locale) });
+        await sendTelegramWizardPrompt(message, senderId, chatKey, state, locale);
         return true;
     }
 
@@ -679,12 +609,25 @@ async function handleTelegramWizardMessage(message: Api.Message, senderId: numbe
                 return true;
             }
 
+            try {
+                await validateTelegramSourceInput(state.source!, locale);
+            } catch {
+                await message.reply({ message: t(locale, 'bot.wizard.sourceUnavailable', { source: state.source }) });
+                return true;
+            }
             state.step = 'path';
-            await message.reply({ message: buildTelegramWizardPrompt(state, locale) });
+            await sendTelegramWizardPrompt(message, senderId, chatKey, state, locale);
             return true;
         }
-        state.step = 'path';
-        await message.reply({ message: buildTelegramWizardPrompt(state, locale) });
+        try {
+            await validateTelegramSourceInput(state.source!, locale);
+        } catch {
+            await message.reply({ message: t(locale, 'bot.wizard.sourceUnavailable', { source: state.source }) });
+            return true;
+        }
+        state.step = state.editing ? 'confirm' : state.kind === 'tg_tag' ? 'tag' : 'start_date';
+        state.editing = false;
+        await sendTelegramWizardPrompt(message, senderId, chatKey, state, locale);
         return true;
     }
 
@@ -694,7 +637,7 @@ async function handleTelegramWizardMessage(message: Api.Message, senderId: numbe
             delete state.customFolder;
         } else {
             try {
-                state.customFolder = await rememberRecentTelegramPathPersistent(message.chatId?.toString() || 'unknown', input, locale);
+                state.customFolder = sanitizeCustomStoragePath(input, locale);
             } catch (error) {
                 await message.reply({ message: t(locale, 'bot.wizard.pathInvalid', { error: (error as Error).message }) });
                 return true;
@@ -702,10 +645,10 @@ async function handleTelegramWizardMessage(message: Api.Message, senderId: numbe
         }
 
         if (state.kind === 'tg_sub_manage') {
-            telegramWizardStates.delete(senderId, chatKey);
             try {
                 if (state.subscriptionId) {
                     const sub = await updateTelegramSubscriptionFolder(senderId, state.subscriptionId, state.customFolder || null);
+                    if (telegramWizardStates.get(senderId, chatKey)?.value === state) telegramWizardStates.delete(senderId, chatKey);
                     const rowsAfterUpdate = await listManageableTelegramSubscriptions(senderId);
                     await message.reply({
                         message: [
@@ -718,6 +661,7 @@ async function handleTelegramWizardMessage(message: Api.Message, senderId: numbe
                     });
                 } else {
                     const sub = await subscribeTelegramChannel(senderId, message.chatId?.toString(), state.source!, state.customFolder);
+                    if (telegramWizardStates.get(senderId, chatKey)?.value === state) telegramWizardStates.delete(senderId, chatKey);
                     await message.reply({
                         message: [
                             t(locale, 'bot.wizard.subscribed', { source: sub.title || sub.source }),
@@ -737,73 +681,81 @@ async function handleTelegramWizardMessage(message: Api.Message, senderId: numbe
         }
 
         if (state.kind === 'tg_tag' || state.kind === 'tg_date') {
-            state.step = state.includeComments !== undefined ? (state.kind === 'tg_tag' ? 'tag' : 'start_date') : 'comments';
-            const reply = await message.reply({ message: buildTelegramWizardPrompt(state, locale), buttons: state.step === 'comments' ? buildTelegramCommentsKeyboard(locale) : undefined });
-            if (state.step === 'comments') {
-                // Callback validation must bind to the new buttons, not the initial wizard message.
-                refreshTelegramWizardState(senderId, chatKey, state, (reply as Api.Message).id);
+            if (!state.target) {
+                const selectedTarget = await peekTelegramTargetState(chatKey);
+                const target = selectedTarget
+                    ? storageManager.getTarget(selectedTarget.provider, selectedTarget.accountId)
+                    : storageManager.getActiveTarget();
+                const accounts = await storageManager.getAccounts();
+                state.targetSelection = selectedTarget;
+                state.target = target;
+                state.targetProvider = target.provider.name;
+                state.targetAccountId = target.accountId;
+                state.targetAccountName = accounts.find(account => String(account.id) === String(target.accountId || ''))?.name;
             }
+            state.includeComments ??= false;
+            state.commentsMaxPerPost = TELEGRAM_COMMENTS_MAX_PER_POST;
+            state.step = 'confirm';
+            state.editing = false;
+            await sendTelegramWizardPrompt(message, senderId, chatKey, state, locale);
             return true;
         }
         return true;
 
     }
 
-    if (state.step === 'comments') {
-        const enabled = /^(开|开启|是|包含|评论|评论区|yes|y|on|true|1)$/i.test(input);
-        const disabled = /^(关|关闭|否|不包含|仅频道|no|n|off|false|0)$/i.test(input);
-        if (!enabled && !disabled) {
-            await message.reply({ message: t(locale, 'bot.wizard.invalidComments') });
-            return true;
-        }
-        state.includeComments = enabled;
-        state.commentsMaxPerPost = TELEGRAM_COMMENTS_MAX_PER_POST;
-        state.step = state.kind === 'tg_tag' ? 'tag' : 'start_date';
-        await message.reply({ message: buildTelegramWizardPrompt(state, locale) });
-        return true;
-    }
 
     if (state.step === 'confirm') {
-        if (!/^(确认|confirm|yes|y)$/i.test(input)) {
+        if (!/^(确认|confirm|yes|y|подтвердить)$/i.test(input) || (callbackMessageId === undefined && replyToId !== lookup.record.originMessageId)) {
             await message.reply({ message: t(locale, 'bot.wizard.confirmInput') });
             return true;
         }
-        telegramWizardStates.delete(senderId, chatKey);
-        try {
-            if (state.kind === 'tg_tag') {
-                const queuedMsg = await message.reply({ message: t(locale, 'bot.legacy.confirmTag', { source: state.source, tag: state.tag?.startsWith('#') ? state.tag : `#${state.tag}` }) });
-                await replyWithJobResult(queuedMsg as Api.Message, message, enqueueTelegramTagDownload(client!, message, senderId, state.source!, state.tag!, state.customFolder, {
+        const confirmationMessageId = lookup.record.originMessageId!;
+        let queuedMsg: Api.Message | undefined;
+        const editConfirmation = (text: string, buttons: Api.TypeReplyMarkup | undefined = undefined) => client!.editMessage(message.peerId, {
+            message: confirmationMessageId, text, buttons, linkPreview: false,
+        });
+        void submitTelegramWizard(state, {
+            submit: async onCreated => {
+                await editConfirmation(t(locale, 'bot.wizard.submitting'));
+                queuedMsg = await message.reply({ message: t(locale, 'bot.wizard.preparing'), linkPreview: false }) as Api.Message;
+                const options = {
                     includeComments: Boolean(state.includeComments), commentsMaxPerPost: state.commentsMaxPerPost || TELEGRAM_COMMENTS_MAX_PER_POST,
-                    onScanComplete: summary => updateScanStatusMessage(queuedMsg as Api.Message, summary, locale), onProgress: summary => updateJobProgressMessage(queuedMsg as Api.Message, summary, locale, senderId),
-                    target: state.target,
-                }), 'tag', locale);
-            } else {
-                const queuedMsg = await message.reply({ message: t(locale, 'bot.legacy.confirmDate', { source: state.source, startDate: state.startDate, endDate: state.endDate }) });
-                await replyWithJobResult(queuedMsg as Api.Message, message, enqueueTelegramDateDownload(client!, message, senderId, state.source!, state.startDate!, state.endDate!, state.customFolder, {
-                    includeComments: Boolean(state.includeComments), commentsMaxPerPost: state.commentsMaxPerPost || TELEGRAM_COMMENTS_MAX_PER_POST,
-                    onScanComplete: summary => updateScanStatusMessage(queuedMsg as Api.Message, summary, locale), onProgress: summary => updateJobProgressMessage(queuedMsg as Api.Message, summary, locale, senderId),
-                    target: state.target,
-                }), 'date', locale);
-            }
-        } catch (error) {
-            await message.reply({ message: t(locale, 'bot.legacy.submitFailed', { error: error instanceof Error ? error.message : String(error) }) });
-        }
+                    target: state.target, progressMessageId: queuedMsg.id, locale, onCreated,
+                };
+                return state.kind === 'tg_tag'
+                    ? enqueueTelegramTagDownload(client!, message, senderId, state.source!, state.tag!, state.customFolder, options)
+                    : enqueueTelegramDateDownload(client!, message, senderId, state.source!, state.startDate!, state.endDate!, state.customFolder, options);
+            },
+            onCreated: async jobId => {
+                if (telegramWizardStates.get(senderId, chatKey)?.value === state) telegramWizardStates.delete(senderId, chatKey);
+                const effects = await Promise.allSettled([
+                    consumeConfirmedTelegramTargetState(chatKey, state.targetSelection),
+                    editConfirmation(t(locale, 'bot.wizard.submitted', { jobId })),
+                    ...(state.customFolder ? [rememberRecentTelegramPathPersistent(chatKey, state.customFolder, locale)] : []),
+                ]);
+                if (effects.some(result => result.status === 'rejected')) console.warn('Telegram wizard post-creation update failed', { jobId });
+            },
+            onRejected: async () => {
+                if (queuedMsg) await client!.deleteMessages(message.peerId, [queuedMsg.id], { revoke: true }).catch(() => undefined);
+                if (telegramWizardStates.get(senderId, chatKey)?.value !== state) return;
+                refreshTelegramWizardState(senderId, chatKey, state, confirmationMessageId);
+                await editConfirmation(`${t(locale, 'bot.wizard.submitRetry')}\n\n${buildTelegramWizardPrompt(state, locale)}`, buildTelegramDownloadConfirmKeyboard(state, locale));
+            },
+        }).catch(() => console.warn('Telegram wizard could not restore confirmation'));
         return true;
     }
 
     if (state.step === 'tag') {
-        state.tag = input;
-        const selectedTarget = await consumeOrGetTelegramTargetState(chatKey);
-        const target = selectedTarget
-            ? storageManager.getTarget(selectedTarget.provider, selectedTarget.accountId)
-            : storageManager.getActiveTarget();
-        const accounts = await storageManager.getAccounts();
-        state.target = target;
-        state.targetProvider = target.provider.name;
-        state.targetAccountId = target.accountId;
-        state.targetAccountName = accounts.find(account => String(account.id) === String(target.accountId || ''))?.name || (target.provider.name === 'local' ? '服务器本地目录' : undefined);
-        state.step = 'confirm';
-        await message.reply({ message: buildTelegramWizardPrompt(state, locale) });
+        try {
+            state.tag = normalizeHashtag(input, locale);
+        } catch {
+            await message.reply({ message: t(locale, 'channels.errors.hashtagInvalid') });
+            return true;
+        }
+        state.step = state.editing ? 'confirm' : 'path';
+        state.editing = false;
+        await sendTelegramWizardPrompt(message, senderId, chatKey, state, locale);
         return true;
     }
 
@@ -814,7 +766,7 @@ async function handleTelegramWizardMessage(message: Api.Message, senderId: numbe
         }
         state.startDate = input;
         state.step = 'end_date';
-        await message.reply({ message: buildTelegramWizardPrompt(state, locale) });
+        await sendTelegramWizardPrompt(message, senderId, chatKey, state, locale);
         return true;
     }
 
@@ -834,18 +786,13 @@ async function handleTelegramWizardMessage(message: Api.Message, senderId: numbe
     state.endDate = input;
     state.dayCount = dateRange.dayCount;
     state.requiresLargeRangeConfirmation = dateRange.requiresLargeRangeConfirmation;
-    const selectedTarget = await consumeOrGetTelegramTargetState(chatKey);
-    const target = selectedTarget
-        ? storageManager.getTarget(selectedTarget.provider, selectedTarget.accountId)
-        : storageManager.getActiveTarget();
-    const accounts = await storageManager.getAccounts();
-    state.target = target;
-    state.targetProvider = target.provider.name;
-    state.targetAccountId = target.accountId;
-    state.targetAccountName = accounts.find(account => String(account.id) === String(target.accountId || ''))?.name || (target.provider.name === 'local' ? '服务器本地目录' : undefined);
-    state.step = 'confirm';
-    await message.reply({ message: buildTelegramWizardPrompt(state, locale) });
+    state.step = state.editing ? 'confirm' : 'path';
+    state.editing = false;
+    await sendTelegramWizardPrompt(message, senderId, chatKey, state, locale);
     return true;
+    } finally {
+        state.processing = false;
+    }
 }
 
 async function listManageableTelegramSubscriptions(userId: number): Promise<any[]> {
@@ -1028,7 +975,7 @@ async function renderStartAfterLocale(update: Api.UpdateBotCallbackQuery, userId
     await client!.editMessage(update.peer, {
         message: Number(update.msgId),
         text: authenticated ? t(locale, 'auth.welcomeBack') : t(locale, 'auth.startPrompt'),
-        buttons: authenticated ? new Api.ReplyInlineMarkup({ rows: [] }) : generatePasswordKeyboard(0, locale),
+        buttons: authenticated ? undefined : generatePasswordKeyboard(0, locale),
     });
 }
 
@@ -1147,7 +1094,7 @@ async function handlePasswordCallback(update: Api.UpdateBotCallbackQuery): Promi
                     await client.editMessage(update.peer, {
                         message: update.msgId,
                         text: buildAuthSuccess(locale),
-                        buttons: new Api.ReplyInlineMarkup({ rows: [] }),
+                        buttons: undefined,
                     });
                     await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: t(locale, 'auth.success') }));
                     return;
@@ -1219,9 +1166,10 @@ async function handleUploadReceiptCallback(update: Api.UpdateBotCallbackQuery, d
     const match = data.match(/^receipt_(retry|failures)_([A-Za-z0-9_-]+)$/);
     if (!match) return;
     const [, action, taskId] = match;
-    const chatId = resolveTaskChatIdForControl(taskId);
+    const receipt = await getTaskReceipt(taskId, userId);
+    const chatId = receipt?.chatId || resolveTaskChatIdForControl(taskId);
     const callbackChatId = callbackChatKey(update, userId);
-    if (!chatId || callbackChatId !== messageChatKey(({ chatId } as unknown) as Api.Message, userId) || !canControlTask(taskId, chatId, userId)) {
+    if (!chatId || callbackChatId !== messageChatKey(({ chatId } as unknown) as Api.Message, userId) || (!receipt && !canControlTask(taskId, chatId, userId))) {
         await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: t(locale, 'bot.callback.taskCardInvalid'), alert: true }));
         return;
     }
@@ -1231,7 +1179,7 @@ async function handleUploadReceiptCallback(update: Api.UpdateBotCallbackQuery, d
         await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: result.retried > 0 ? t(locale, 'bot.callback.retryCount', { count: result.retried }) : t(locale, 'bot.callback.noRetry') }));
         return;
     }
-    const details = listFailedDownloadTaskDetails(taskId, chatId, userId);
+    const details = receipt ? await taskReceiptFailures(receipt) : listFailedDownloadTaskDetails(taskId, chatId, userId, locale);
     await client.sendMessage(update.peer, { message: [t(locale, 'bot.callback.failureDetailsTitle'), '', ...(details.length ? details.slice(0, 30).map(item => `• ${item}`) : [t(locale, 'bot.callback.failureDetailsEmpty')])].join('\n') });
     await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: t(locale, 'bot.callback.failureDetailsSent') }));
 }
@@ -1269,6 +1217,18 @@ async function handleTaskQueueCallback(update: Api.UpdateBotCallbackQuery, data:
         return;
     }
     try {
+        const jobIds = getTaskControlJobIds(taskId, controlChatId, userId);
+        if (jobIds.length > 0) {
+            // Old session cards may cover channel jobs without any ordinary queue
+            // groups. Route them through persisted-job controls and confirmation.
+            registerProgressCard(controlChatId, Number(update.msgId), userId);
+            const actionCode = action === 'pause' ? 'p' : action === 'resume' ? 'r' : 'x';
+            const callback = jobIds.length === 1
+                ? `tc_a_${actionCode}_c_${jobIds[0].slice(0, 12)}_0`
+                : 'tc_l_0';
+            await handleTaskCenterCallback(client, update, callback);
+            return;
+        }
         if (action === 'pause') {
             const result = pauseDownloadTasks(taskId);
             await refreshSilentProgress(client, update.peer, userId);
@@ -1307,7 +1267,7 @@ async function handleTelegramDownloadModeCallback(update: Api.UpdateBotCallbackQ
         chatKey,
         messageId: Number(update.msgId),
         action,
-        allowedActions: ['cancel', 'mode_date', 'mode_tag', 'comments_on', 'comments_off'],
+        allowedActions: ['cancel', 'mode_date', 'mode_tag', 'comments_on', 'comments_off', 'confirm', 'edit_source', 'edit_filter', 'edit_path', 'default_path'],
     });
     if (!validation.ok) {
         await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: t(locale, 'bot.wizard.callbackExpired'), alert: true }));
@@ -1315,17 +1275,56 @@ async function handleTelegramDownloadModeCallback(update: Api.UpdateBotCallbackQ
     }
     const record = telegramWizardStates.get(userId, chatKey)!;
     const state = record.value;
-    if (data === 'tgd_cancel') {
-        telegramWizardStates.delete(userId, chatKey);
-        await client.editMessage(update.peer, { message: update.msgId, text: t(locale, 'bot.wizard.downloadCancelled') });
+    if (state.cancelling || state.cancelled) {
         await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: t(locale, 'bot.callback.cancelled') }));
+        return;
+    }
+    if (state.processing || state.submitting || state.createdJobId) {
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: t(locale, 'bot.wizard.submitting') }));
+        return;
+    }
+    const expectedStep = action.startsWith('mode_') ? 'mode' : action === 'default_path' ? 'path' : 'confirm';
+    if (action !== 'cancel' && state.step !== expectedStep) {
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: t(locale, 'bot.wizard.callbackExpired'), alert: true }));
+        return;
+    }
+    if (action === 'confirm' || action === 'default_path') {
+        const [prompt] = await client.getMessages(update.peer, { ids: [update.msgId] });
+        if (!prompt) {
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: t(locale, 'bot.wizard.callbackExpired'), alert: true }));
+            return;
+        }
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId }));
+        await handleTelegramWizardMessage(prompt, userId, action === 'confirm' ? 'confirm' : 'skip', Number(update.msgId), expectedStep);
+        return;
+    }
+    if (action.startsWith('edit_')) {
+        state.editing = true;
+        state.step = action === 'edit_source' ? 'source' : action === 'edit_path' ? 'path' : state.kind === 'tg_tag' ? 'tag' : 'start_date';
+        refreshTelegramWizardState(userId, chatKey, state, record.originMessageId);
+        await client.editMessage(update.peer, { message: update.msgId, text: buildTelegramWizardPrompt(state, locale), buttons: buildTelegramWizardKeyboard(state, locale), linkPreview: false });
+        await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId }));
+        return;
+    }
+    if (data === 'tgd_cancel') {
+        try {
+            await cancelTelegramWizard(state, {
+                updateCard: () => client!.editMessage(update.peer, { message: Number(update.msgId), text: t(locale, 'bot.wizard.downloadCancelled'), buttons: undefined }),
+                clearDraft: () => {
+                    if (telegramWizardStates.get(userId, chatKey)?.value === state) telegramWizardStates.delete(userId, chatKey);
+                },
+            });
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: t(locale, 'bot.callback.cancelled') }));
+        } catch (error) {
+            await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: t(locale, 'bot.callback.operationFailed', { error: error instanceof Error ? error.message : String(error) }), alert: true }));
+        }
         return;
     }
     if (data === 'tgd_mode_date') {
         state.kind = 'tg_date';
         state.step = 'source';
         putTelegramWizardState(userId, chatKey, state, record.originMessageId);
-        await client.editMessage(update.peer, { message: update.msgId, text: buildTelegramWizardPrompt(state, locale) });
+        await client.editMessage(update.peer, { message: update.msgId, text: buildTelegramWizardPrompt(state, locale), buttons: buildTelegramWizardKeyboard(state, locale) });
         await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: t(locale, 'bot.wizard.modeDate') }));
         return;
     }
@@ -1333,16 +1332,16 @@ async function handleTelegramDownloadModeCallback(update: Api.UpdateBotCallbackQ
         state.kind = 'tg_tag';
         state.step = 'source';
         putTelegramWizardState(userId, chatKey, state, record.originMessageId);
-        await client.editMessage(update.peer, { message: update.msgId, text: buildTelegramWizardPrompt(state, locale) });
+        await client.editMessage(update.peer, { message: update.msgId, text: buildTelegramWizardPrompt(state, locale), buttons: buildTelegramWizardKeyboard(state, locale) });
         await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: t(locale, 'bot.wizard.modeTag') }));
         return;
     }
     if (data === 'tgd_comments_on' || data === 'tgd_comments_off') {
         state.includeComments = data === 'tgd_comments_on';
         state.commentsMaxPerPost = TELEGRAM_COMMENTS_MAX_PER_POST;
-        state.step = state.kind === 'tg_tag' ? 'tag' : 'start_date';
+        state.step = 'confirm';
         putTelegramWizardState(userId, chatKey, state, record.originMessageId);
-        await client.editMessage(update.peer, { message: update.msgId, text: buildTelegramWizardPrompt(state, locale) });
+        await client.editMessage(update.peer, { message: update.msgId, text: buildTelegramWizardPrompt(state, locale), buttons: buildTelegramDownloadConfirmKeyboard(state, locale), linkPreview: false });
         await client.invoke(new Api.messages.SetBotCallbackAnswer({
             queryId: update.queryId,
             message: t(locale, state.includeComments ? 'bot.wizard.commentsOn' : 'bot.wizard.commentsOff'),
@@ -1365,6 +1364,7 @@ async function handleTelegramSubscriptionCallback(update: Api.UpdateBotCallbackQ
         await client.editMessage(update.peer, {
             message: update.msgId,
             text: buildTelegramWizardPrompt(state, locale),
+            buttons: buildTelegramWizardKeyboard(state, locale),
         });
         await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: t(locale, 'bot.callback.sendChannel') }));
         return;
@@ -1472,7 +1472,7 @@ async function handleTelegramSubscriptionCallback(update: Api.UpdateBotCallbackQ
     }
     if (parsed.action === 'backfill') {
         const state: TelegramWizardState = { kind: 'tg_date', step: 'start_date', source: target.source };
-        const sent = await client.sendMessage(update.peer, { message: buildTelegramWizardPrompt(state, locale) });
+        const sent = await client.sendMessage(update.peer, { message: buildTelegramWizardPrompt(state, locale), buttons: buildTelegramWizardKeyboard(state, locale) });
         putTelegramWizardState(userId, callbackChatKey(update, userId), state, sent.id);
         await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: t(locale, 'bot.callback.enterBackfillDate') }));
         return;
@@ -1493,7 +1493,7 @@ async function handleTelegramSubscriptionCallback(update: Api.UpdateBotCallbackQ
             subscriptionTitle: target.title,
             subscriptionSource: target.source,
         };
-        const sent = await client.sendMessage(update.peer, { message: buildTelegramWizardPrompt(state, locale) });
+        const sent = await client.sendMessage(update.peer, { message: buildTelegramWizardPrompt(state, locale), buttons: buildTelegramWizardKeyboard(state, locale) });
         putTelegramWizardState(userId, callbackChatKey(update, userId), state, sent.id);
         await client.invoke(new Api.messages.SetBotCallbackAnswer({ queryId: update.queryId, message: t(locale, 'bot.callback.sendFolder') }));
         return;
@@ -1889,8 +1889,13 @@ async function initTelegramBotInternal(credentialsOverride?: TelegramBotCredenti
                             return;
                         }
                         try {
-                            const queuedMsg = await message.reply({ message: t(locale, 'bot.legacy.confirmDate', { source: parts[0], startDate: parts[1], endDate: parts[2] }) });
-                            await replyWithJobResult(queuedMsg as Api.Message, message, enqueueTelegramDateDownload(client, message, senderId, parts[0], parts[1], parts[2]), 'date', locale);
+                            const queuedMsg = await message.reply({ message: t(locale, 'bot.wizard.preparing') }) as Api.Message;
+                            let created = false;
+                            void enqueueTelegramDateDownload(client, message, senderId, parts[0], parts[1], parts[2], undefined, {
+                                progressMessageId: queuedMsg.id, locale, onCreated: () => { created = true; },
+                            }).catch(() => {
+                                if (!created) void queuedMsg.edit({ text: t(locale, 'bot.wizard.commandSubmitFailed') }).catch(() => undefined);
+                            });
                         } catch (error) {
                             await message.reply({ message: t(locale, 'bot.legacy.failed', { mode: t(locale, 'bot.wizard.modeDate'), error: error instanceof Error ? error.message : String(error) }) });
                         }
@@ -1902,8 +1907,13 @@ async function initTelegramBotInternal(credentialsOverride?: TelegramBotCredenti
                             return;
                         }
                         try {
-                            const queuedMsg = await message.reply({ message: t(locale, 'bot.legacy.confirmTag', { source: parts[0], tag: parts[1].startsWith('#') ? parts[1] : `#${parts[1]}` }) });
-                            await replyWithJobResult(queuedMsg as Api.Message, message, enqueueTelegramTagDownload(client, message, senderId, parts[0], parts[1]), 'tag', locale);
+                            const queuedMsg = await message.reply({ message: t(locale, 'bot.wizard.preparing') }) as Api.Message;
+                            let created = false;
+                            void enqueueTelegramTagDownload(client, message, senderId, parts[0], parts[1], undefined, {
+                                progressMessageId: queuedMsg.id, locale, onCreated: () => { created = true; },
+                            }).catch(() => {
+                                if (!created) void queuedMsg.edit({ text: t(locale, 'bot.wizard.commandSubmitFailed') }).catch(() => undefined);
+                            });
                         } catch (error) {
                             await message.reply({ message: t(locale, 'bot.legacy.failed', { mode: t(locale, 'bot.wizard.modeTag'), error: error instanceof Error ? error.message : String(error) }) });
                         }
@@ -1925,8 +1935,13 @@ async function initTelegramBotInternal(credentialsOverride?: TelegramBotCredenti
                         return;
                     }
                     try {
-                        const queuedMsg = await message.reply({ message: t(locale, 'bot.legacy.confirmDate', { source: parts[0], startDate: parts[1], endDate: parts[2] }) });
-                            await replyWithJobResult(queuedMsg as Api.Message, message, enqueueTelegramDateDownload(client, message, senderId, parts[0], parts[1], parts[2]), 'date', locale);
+                        const queuedMsg = await message.reply({ message: t(locale, 'bot.wizard.preparing') }) as Api.Message;
+                        let created = false;
+                        void enqueueTelegramDateDownload(client, message, senderId, parts[0], parts[1], parts[2], undefined, {
+                            progressMessageId: queuedMsg.id, locale, onCreated: () => { created = true; },
+                        }).catch(() => {
+                            if (!created) void queuedMsg.edit({ text: t(locale, 'bot.wizard.commandSubmitFailed') }).catch(() => undefined);
+                        });
                     } catch (error) {
                         await message.reply({ message: t(locale, 'bot.legacy.failed', { mode: t(locale, 'bot.wizard.modeDate'), error: error instanceof Error ? error.message : String(error) }) });
                     }
@@ -1945,8 +1960,13 @@ async function initTelegramBotInternal(credentialsOverride?: TelegramBotCredenti
                         return;
                     }
                     try {
-                        const queuedMsg = await message.reply({ message: t(locale, 'bot.legacy.confirmTag', { source: parts[0], tag: parts[1].startsWith('#') ? parts[1] : `#${parts[1]}` }) });
-                            await replyWithJobResult(queuedMsg as Api.Message, message, enqueueTelegramTagDownload(client, message, senderId, parts[0], parts[1]), 'tag', locale);
+                        const queuedMsg = await message.reply({ message: t(locale, 'bot.wizard.preparing') }) as Api.Message;
+                        let created = false;
+                        void enqueueTelegramTagDownload(client, message, senderId, parts[0], parts[1], undefined, {
+                            progressMessageId: queuedMsg.id, locale, onCreated: () => { created = true; },
+                        }).catch(() => {
+                            if (!created) void queuedMsg.edit({ text: t(locale, 'bot.wizard.commandSubmitFailed') }).catch(() => undefined);
+                        });
                     } catch (error) {
                         await message.reply({ message: t(locale, 'bot.legacy.failed', { mode: t(locale, 'bot.wizard.modeTag'), error: error instanceof Error ? error.message : String(error) }) });
                     }
@@ -1973,20 +1993,6 @@ async function initTelegramBotInternal(credentialsOverride?: TelegramBotCredenti
 
                 if (text === '/target' || text.startsWith('/target ')) {
                     await handleTarget(message, text.split(/\s+/).slice(1));
-                    return;
-                }
-
-                if (text === '/find' || text.startsWith('/find ')) {
-                    await handleFind(message, text.split(/\s+/).slice(1), await getTelegramUserLocaleOrDefault(senderId));
-                    return;
-                }
-
-                if (text === '/list' || text.startsWith('/list ')) {
-                    if (!(await isAuthenticatedAsync(senderId))) {
-                        await message.reply({ message: t(messageLocale, 'auth.required') });
-                        return;
-                    }
-                    await handleList(message, text.split(/\s+/).slice(1), await getTelegramUserLocaleOrDefault(senderId));
                     return;
                 }
 
@@ -2157,10 +2163,10 @@ async function initTelegramBotInternal(credentialsOverride?: TelegramBotCredenti
                                     return;
                                 }
                                 await activate2FA();
-                                await message.reply({ message: t(locale, 'auth.twoFactorActivated'), buttons: new Api.ReplyInlineMarkup({ rows: [] }) });
+                                await message.reply({ message: t(locale, 'auth.twoFactorActivated') });
                             } else {
                                 await persistAuthenticatedUser(senderId);
-                                await message.reply({ message: t(locale, 'auth.twoFactorLoginOk'), buttons: new Api.ReplyInlineMarkup({ rows: [] }) });
+                                await message.reply({ message: t(locale, 'auth.twoFactorLoginOk') });
                             }
 
                             // Clean up sensitive messages

@@ -77,8 +77,8 @@ function collectCompletedFolders(
     batches
         .filter(batch => batch.completed === batch.totalFiles)
         .forEach(batch => {
-            const folder = batch.folderPath || batch.folderName;
-            if (folder) folders.add(folder);
+            const folder = batch.folderPath;
+            if (folder != null) folders.add(folder || '/');
         });
     return Array.from(folders);
 }
@@ -89,7 +89,7 @@ function formatFolderSummary(folders: string[], maxItems = 4): string[] {
     const lines = [`📁 保存路径：${visible[0]}`];
     visible.slice(1).forEach(folder => lines.push(`   └ ${folder}`));
     if (folders.length > visible.length) {
-        lines.push(`   └ 另有 ${folders.length - visible.length} 个路径，可用 /list 查看`);
+        lines.push(`   └ 另有 ${folders.length - visible.length} 个路径，可在网页端查看`);
     }
     return lines;
 }
@@ -148,12 +148,10 @@ export const MSG = {
     UNSUPPORTED_MEDIA: '⚠️ 暂不支持此类媒体格式',
 
     // 空状态
-    EMPTY_FILES: '📮 暂无上传记录',
     EMPTY_TASKS: '📮 当前没有进行中的任务',
 
     // 错误
     ERR_STORAGE: '❌ 获取存储统计失败',
-    ERR_FILE_LIST: '❌ 获取文件列表失败',
     ERR_DELETE: '❌ 删除文件失败',
     ERR_TASKS: '❌ 获取任务列表失败',
 
@@ -235,57 +233,6 @@ export function buildStorageReport(data: StorageReportData, locale: TelegramLoca
         t(locale, 'messages.storage.queue'),
         t(locale, 'messages.storage.queueCounts', { active: data.queueActive, pending: data.queuePending }),
     ].join('\n');
-}
-
-// ─── 文件列表 ────────────────────────────────────────────────
-
-interface FileListItem {
-    id: string;
-    name: string;
-    type: string;
-    size: string | number;
-    folder?: string;
-    created_at: string;
-}
-
-function compactTelegramText(value: unknown, maxLength: number): string {
-    const text = String(value || '').replace(/[\r\n\t]+/g, ' ').replace(/[*_`[\]\\]/g, '').trim();
-    return text.length > maxLength ? `${text.slice(0, Math.max(1, maxLength - 1))}…` : text;
-}
-
-export function buildFileList(files: FileListItem[], total: number, locale: TelegramLocale = DEFAULT_LOCALE): string {
-    const visibleFiles = files.slice(0, 12);
-    const lines: string[] = [
-        t(locale, 'messages.files.title', { count: visibleFiles.length }),
-        LINE,
-    ];
-
-    visibleFiles.forEach((file, index) => {
-        const typeEmoji = getTypeEmoji(
-            file.type === 'image' ? 'image/' :
-                file.type === 'video' ? 'video/' :
-                    file.type === 'audio' ? 'audio/' : 'other'
-        );
-        const size = formatBytes(typeof file.size === 'string' ? parseInt(file.size) : file.size);
-        const date = new Date(file.created_at).toLocaleString('zh-CN', {
-            month: '2-digit',
-            day: '2-digit',
-            hour: '2-digit',
-            minute: '2-digit',
-        });
-
-        const displayName = compactTelegramText(file.name, 36);
-        const folder = compactTelegramText(file.folder, 48);
-
-        lines.push(`${index + 1}. ${typeEmoji} **${displayName || t(locale, 'messages.files.unnamed')}**`);
-        lines.push(`    ${size} · ${date}${folder ? ` · 📁 ${folder}` : ''}`);
-        lines.push(`    ID: \`${file.id.substring(0, 8)}\``);
-    });
-
-    lines.push('');
-    lines.push(t(locale, 'messages.files.hint'));
-
-    return lines.join('\n');
 }
 
 // ─── 任务队列状态 ────────────────────────────────────────────
@@ -481,10 +428,13 @@ interface SilentProgressBatch {
     completed: number;
     successful: number;
     failed: number;
+    savedBytes?: number;
     providerName?: string;
+    storageLabel?: string;
     queuePending?: number;
     currentFileName?: string;
     currentFileActive?: boolean;
+    downloadProgress?: { percent: number; completedBytes: number; totalBytes: number; speedBytesPerSecond: number };
 }
 
 interface SilentProgressFile {
@@ -493,6 +443,8 @@ interface SilentProgressFile {
     downloaded?: number;
     total?: number;
     providerName?: string;
+    storageLabel?: string;
+    speedBytesPerSecond?: number;
     folder?: string | null;
 }
 
@@ -538,11 +490,14 @@ export function buildSilentProgress(
         queuePaused
             ? (systemPause ? `⏸️ **系统保护暂停**` : `⏸️ **后台下载已暂停**`)
             : queuePausing
-                ? `⏸️ **正在完成当前文件，随后暂停**`
+                ? `⏸️ **下载已暂停，保留当前进度**`
                 : `🤐 **后台批量处理中**`,
         `${progress} (${completedFiles}/${totalFiles})`,
+        `⚡ ${formatBytes(queuePaused ? 0 : batches.reduce((sum, batch) => sum + (batch.downloadProgress?.speedBytesPerSecond || 0), 0) + singleFiles.reduce((sum, file) => sum + (file.phase === 'downloading' ? file.speedBytesPerSecond || 0 : 0), 0))}/s`,
         ``,
         `✅ 成功: ${successfulFiles}　❌ 失败: ${failedFiles}　⏳ 剩余: ${remainingFiles}`,
+        ...Array.from(new Set([...batches.map(batch => batch.storageLabel || batch.providerName), ...singleFiles.map(file => file.storageLabel || file.providerName)].filter(Boolean))).map(label => `📍 存储：${label}`),
+        ...formatFolderSummary(Array.from(new Set([...batches.map(batch => batch.folderPath), ...singleFiles.map(file => file.folder)].filter((folder): folder is string => folder != null)))),
         ...(currentFile ? [`📄 当前: ${currentFile}`] : []),
         ...(activeBatch ? [`📁 批次: ${activeBatch.folderName}`] : []),
         ...(activeBatch?.queuePending ? [`🕒 队列等待: ${activeBatch.queuePending}`] : []),
@@ -571,8 +526,8 @@ export function buildSilentAllTasksComplete(
 ): string {
     const successCount = Math.max(0, totalCount - failedCount);
     const providers = new Set<string>();
-    singleFiles.filter(f => f.phase === 'success' && f.providerName).forEach(f => providers.add(f.providerName!));
-    batches.filter(b => b.providerName).forEach(b => providers.add(b.providerName!));
+    singleFiles.filter(f => f.phase === 'success' && (f.storageLabel || f.providerName)).forEach(f => providers.add(f.storageLabel || f.providerName!));
+    batches.filter(b => b.storageLabel || b.providerName).forEach(b => providers.add(b.storageLabel || b.providerName!));
     const folders = collectCompletedFolders(singleFiles, batches);
     const detailLines = [
         ...(providers.size > 0 ? [`📍 存储: ${Array.from(providers).map(p => getProviderDisplayName(p)).join(', ')}`] : []),
@@ -603,17 +558,24 @@ export interface ConsolidatedUploadFile {
     typeEmoji: string;
     phase: 'queued' | 'downloading' | 'saving' | 'success' | 'failed' | 'retrying' | 'cancelled';
     speedBytesPerSecond?: number;
+    paused?: boolean;
     downloaded?: number;
     total?: number;
     size?: number;
     error?: string;
     providerName?: string;
+    storageLabel?: string;
     fileType?: string;
     folder?: string | null;
 }
 
 export interface ConsolidatedBatchEntry {
     id: string;
+    groupId?: string;
+    storageLabel?: string;
+    paused?: boolean;
+    downloadProgress?: { percent: number; completedBytes: number; totalBytes: number; speedBytesPerSecond: number };
+    savedBytes?: number;
     folderName: string;
     folderPath?: string;
     totalFiles: number;
@@ -655,8 +617,6 @@ export async function buildConsolidatedStatus(
 
         const totalSuccessful = successfulSingles + successfulBatches;
         const totalFailed = failedSingles + failedBatches;
-        const totalSize = [...singleFiles.filter(f => f.phase === 'success'), ...batches.flatMap(b => [])]
-            .reduce((sum, f) => sum + (f.size || 0), 0);
 
         statusIcon = totalFailed === 0 ? '✅' : '⚠️';
         statusText = totalFailed === 0 ? '任务全部完成' : `任务完成 (${totalFailed} 个失败)`;
@@ -676,8 +636,8 @@ export async function buildConsolidatedStatus(
 
         const totalSuccessful = successfulSingles + successfulBatches;
         const totalFailed = failedSingles + failedBatches;
-        const totalSize = [...singleFiles.filter(f => f.phase === 'success'), ...batches.flatMap(b => [])]
-            .reduce((sum, f) => sum + (f.size || 0), 0);
+        const totalSize = singleFiles.filter(file => file.phase === 'success').reduce((sum, file) => sum + (file.size || 0), 0)
+            + batches.reduce((sum, batch) => sum + (batch.savedBytes || 0), 0);
 
         lines.push('📊 **完成摘要**');
         lines.push(LINE);
@@ -691,8 +651,8 @@ export async function buildConsolidatedStatus(
 
         // 显示存储提供商
         const providers = new Set<string>();
-        singleFiles.filter(f => f.phase === 'success' && f.providerName).forEach(f => providers.add(f.providerName!));
-        batches.filter(b => b.providerName).forEach(b => providers.add(b.providerName!));
+        singleFiles.filter(f => f.phase === 'success' && (f.storageLabel || f.providerName)).forEach(f => providers.add(f.storageLabel || f.providerName!));
+        batches.filter(b => b.storageLabel || b.providerName).forEach(b => providers.add(b.storageLabel || b.providerName!));
         if (providers.size > 0) {
             lines.push(`📍 存储: ${Array.from(providers).map(p => getProviderDisplayName(p)).join(', ')}`);
         }
@@ -721,7 +681,7 @@ export async function buildConsolidatedStatus(
         // 添加友好的结束消息
         if (totalFailed === 0) {
             lines.push('✅ 上传完成。');
-            lines.push('💡 /list 查看上传记录');
+            lines.push('💡 可在网页端查看上传记录');
         } else {
             lines.push('💡 部分文件上传失败，未自动清理服务器缓存');
             lines.push('🔄 可重新发送失败的文件');
@@ -764,9 +724,15 @@ export async function buildConsolidatedStatus(
                 default:
                     icon = '🕒'; detail = '排队'; break;
             }
+            if (file.paused) {
+                icon = '⏸️';
+                detail = `已暂停下载，继续后从当前位置恢复 · ${formatBytes(file.downloaded || 0)} / ${file.total ? formatBytes(file.total) : '—'} ⚡ 0 B/s`;
+            }
 
             lines.push(`${icon} ${file.typeEmoji} ${file.fileName}`);
             lines.push(`    └ ${detail}`);
+            if (file.storageLabel || file.providerName) lines.push(`    📍 存储：${file.storageLabel || getProviderDisplayName(file.providerName!)}`);
+            if (file.folder != null) lines.push(`    📁 保存目录：${file.folder || '/'}`);
         });
     }
 
@@ -779,8 +745,11 @@ export async function buildConsolidatedStatus(
             const icon = isDone ? (batch.failed === 0 ? '✅' : '⚠️') : '📂';
             lines.push(`${icon} 📁 ${batch.folderName}`);
             if (!isDone) {
-                const progress = generateProgressBar(batch.completed, batch.totalFiles);
+                const telemetry = batch.downloadProgress;
+                const progress = telemetry ? generateProgressBar(telemetry.percent, 100) : generateProgressBar(batch.completed, batch.totalFiles);
                 lines.push(`    ${progress} (${batch.completed}/${batch.totalFiles})`);
+                if (batch.paused) lines.push('    已暂停下载，继续后从当前位置恢复');
+                if (telemetry) lines.push(`    ${formatBytes(telemetry.completedBytes)} / ${telemetry.totalBytes ? formatBytes(telemetry.totalBytes) : '—'} ⚡ ${formatBytes(telemetry.speedBytesPerSecond)}/s`);
                 if (batch.currentFileActive && batch.currentFileName) {
                     lines.push(`    📄 当前: ${batch.currentFileName}`);
                 }
@@ -791,12 +760,10 @@ export async function buildConsolidatedStatus(
             if (batch.queuePending && batch.queuePending > 0 && !isDone) {
                 lines.push(`    ⏳ 队列: ${batch.queuePending}`);
             }
-            if (batch.providerName && isDone) {
-                lines.push(`    📍 ${getProviderDisplayName(batch.providerName)}`);
-            }
-            if (batch.folderPath && isDone) {
-                lines.push(`    📁 ${batch.folderPath}`);
-            }
+            if (batch.storageLabel || batch.providerName) lines.push(`    📍 存储：${batch.storageLabel || getProviderDisplayName(batch.providerName!)}`);
+            lines.push(`    📁 保存目录：${batch.folderPath ?? '正在确定保存目录'}`);
+            if (batch.groupId) lines.push(`    🆔 任务：${batch.groupId}`);
+            if (!isDone) lines.push(`    成功 ${batch.successful} · 失败 ${batch.failed} · 剩余 ${Math.max(0, batch.totalFiles - batch.completed)}`);
         });
     }
 

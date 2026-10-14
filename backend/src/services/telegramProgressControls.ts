@@ -3,7 +3,7 @@ import { DEFAULT_LOCALE, type TelegramLocale } from '../i18n/telegram.js';
 import { buildTaskCenterDetail, type TaskCenterItem } from './telegramTaskCenter.js';
 
 export const TASK_CENTER_CARD_TTL_MS = 24 * 60 * 60 * 1000;
-export const taskCenterCardOwners = new Map<string, { userId: number; expiresAt: number; interactive?: boolean; progress?: boolean }>();
+export const taskCenterCardOwners = new Map<string, { userId: number; expiresAt: number; interactive?: boolean; interactiveUntil?: number; progress?: boolean }>();
 export function taskCenterCardKey(chatId: string, messageId: number): string {
     return `${chatId}:${messageId}`;
 }

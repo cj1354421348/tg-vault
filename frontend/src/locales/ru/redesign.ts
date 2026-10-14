@@ -8,8 +8,6 @@ export const redesign = {
     "loadedFileCount_few": "Загружено {{count}} файла",
     "loadedFileCount_many": "Загружено {{count}} файлов",
     "loadedFileCount_other": "Загружено {{count}} файла",
-    "collapseFolders": "Свернуть папки",
-    "expandFolders": "Развернуть папки",
     "moveSingleOnly": "Чтобы переместить объект, выберите один файл или одну папку."
   },
   "tasks": {

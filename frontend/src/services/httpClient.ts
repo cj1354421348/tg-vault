@@ -2,6 +2,7 @@ import { API_BASE } from './config';
 import { tr } from '../i18n/runtime';
 import { apiActionErrorFromResponse } from './apiActionError';
 import { authService } from './auth';
+import { fetchSettingsRequest } from './settingsRequestCache';
 
 export interface HttpRequestOptions extends RequestInit {
     acceptedStatuses?: readonly number[];
@@ -25,7 +26,7 @@ function mergeHeaders(headers?: HeadersInit): Headers {
 
 export async function apiRequest(path: string, options: HttpRequestOptions = {}): Promise<Response> {
     const { acceptedStatuses = [], fallback = tr('errors.services.generic.requestFailed'), classifyErrors = true, ...init } = options;
-    const response = await fetch(apiUrl(path), {
+    const response = await fetchSettingsRequest(apiUrl(path), {
         ...init,
         credentials: init.credentials ?? 'include',
         headers: mergeHeaders(init.headers),

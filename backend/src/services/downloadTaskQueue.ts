@@ -142,6 +142,7 @@ export class DownloadTaskQueue {
     private readonly onGroupChanged?: (group: DownloadTaskGroupSnapshot) => void | Promise<void>;
     private userPaused = false;
     private readonly scopedUserPauses = new Map<string, { scope: DownloadTaskScope; reason: string }>();
+    private readonly scopeResumeOverrides = new Set<string>();
     private systemPause?: DownloadTaskSystemPause;
     private readonly diskPressureBlockers = new Map<string, { reason: string; recheckMs?: number }>();
     private readonly notificationChains = new Map<string, Promise<void>>();
@@ -157,13 +158,13 @@ export class DownloadTaskQueue {
     }
 
     ensureGroup(input: DownloadTaskGroupInput): DownloadTaskGroupSnapshot {
-        if (this.userPaused && this.active.length === 0 && this.queue.length === 0) this.userPaused = false;
         const id = input.id.trim();
         if (!id) throw new Error('下载任务组 ID 不能为空');
         const now = Date.now();
         const existing = this.groups.get(id);
         if (existing && ['completed', 'cancelled'].includes(this.snapshotGroup(existing).state)) {
             this.groups.delete(id);
+            this.scopeResumeOverrides.delete(id);
         }
         const current = this.groups.get(id);
         if (current) {
@@ -190,7 +191,7 @@ export class DownloadTaskQueue {
             failed: 0,
             cancelled: 0,
             createdAt: now,
-            updatedAt: now,
+            updatedAt: existing ? this.nextGroupVersion(existing, now) : now,
         };
         this.groups.set(id, record);
         this.notifyGroup(record);
@@ -272,21 +273,23 @@ export class DownloadTaskQueue {
                         const activeIndex = this.active.findIndex(item => item.id === task.id);
                         if (activeIndex >= 0) this.active.splice(activeIndex, 1);
                         if (group.stateOverride === 'pausing' && !this.hasActiveGroupTask(group.id)) {
-                            group.stateOverride = this.queue.some(item => item.groupId === group.id) ? 'paused' : undefined;
+                            group.stateOverride = this.queue.some(item => item.groupId === group.id)
+                                || group.completed + group.failed + group.cancelled < group.expectedTotal ? 'paused' : undefined;
                         } else if (group.stateOverride === 'cancelling' && !this.hasActiveGroupTask(group.id)) {
                             group.stateOverride = 'cancelled';
                         }
                         this.pushHistory(task);
+                        if (['completed', 'cancelled'].includes(this.snapshotGroup(group).state)) this.scopeResumeOverrides.delete(group.id);
                         this.notifyGroup(group);
                         this.processNext();
                     }
                 },
             };
             this.queue.push(task);
-            this.notifyGroup(group);
             if (queuedBehindPausedGroup && group.stateOverride === 'pausing' && !this.hasActiveGroupTask(group.id)) {
                 group.stateOverride = 'paused';
             }
+            this.notifyGroup(group);
             this.processNext();
         });
     }
@@ -299,17 +302,19 @@ export class DownloadTaskQueue {
         const groups = Array.from(this.groups.values())
             .filter(group => !group.hidden)
             .filter(group => this.matchesScope(group, scope))
-            .map(group => this.snapshotForDisplay(group))
+            .map(group => this.snapshotGroup(group))
             .filter(group => !['completed', 'cancelled'].includes(group.state))
             .sort((a, b) => a.createdAt - b.createdAt);
+        const counts = this.countsForScope(scope);
+        const status = this.getScopeStatus(scope);
         return {
             groups,
-            active: this.active.length,
-            pending: this.queue.length,
-            paused: this.isGloballyPaused(),
-            pauseReason: this.getPauseReason(),
-            userPaused: this.userPaused,
-            systemPause: this.systemPause,
+            active: counts.active,
+            pending: counts.pending,
+            paused: status.paused,
+            pauseReason: status.reason,
+            userPaused: status.userPaused,
+            systemPause: status.systemPause,
         };
     }
 
@@ -319,12 +324,21 @@ export class DownloadTaskQueue {
         return this.snapshotGroup(access.record);
     }
 
+    /** Includes terminal state while the final persistence notification is in flight. */
+    getGroupSnapshot(groupId: string, scope: DownloadTaskScope = {}, includeHidden = false): DownloadTaskGroupSnapshot | undefined {
+        const exact = this.groups.get(groupId);
+        const matches = (exact ? [exact] : this.findGroupMatches(groupId))
+            .filter(group => includeHidden || !group.hidden)
+            .filter(group => this.matchesScope(group, scope));
+        return matches.length === 1 ? this.snapshotGroup(matches[0]) : undefined;
+    }
+
     getGroup(groupId: string, scope: DownloadTaskScope = {}, includeHidden = false): DownloadTaskGroupSnapshot | undefined {
         const matches = Array.from(this.groups.values())
             .filter(group => includeHidden || !group.hidden)
             .filter(group => this.matchesScope(group, scope))
             .filter(group => group.id === groupId || group.id.startsWith(groupId))
-            .map(group => this.snapshotForDisplay(group))
+            .map(group => this.snapshotGroup(group))
             .filter(group => !['completed', 'cancelled'].includes(group.state));
         return matches.length === 1 ? matches[0] : undefined;
     }
@@ -336,7 +350,11 @@ export class DownloadTaskQueue {
             .filter(group => !['completed', 'cancelled'].includes(group.state));
         const systemBlocked = Boolean(this.systemPause);
         const pausing = groups.some(group => group.state === 'pausing');
-        const groupPaused = groups.some(group => group.state === 'paused');
+        const groupPaused = groups.some(group => {
+            const record = this.groups.get(group.id)!;
+            return record.stateOverride === 'paused' || record.stateOverride === 'pausing'
+                || Boolean(this.getScopedUserPause(record));
+        });
         const scopedPause = this.getScopedUserPause(scope);
         const paused = systemBlocked || this.userPaused || Boolean(scopedPause) || groupPaused;
         return {
@@ -441,6 +459,7 @@ export class DownloadTaskQueue {
         const access = this.resolveGroupForControl(groupId, scope, includeHidden);
         if (access.status !== 'ok' || !access.record) return this.controlResult(access.status, access.record);
         const group = access.record;
+        if (group.stateOverride === 'cancelling') return this.controlResult('terminal', group);
         if (group.stateOverride === 'paused' || group.stateOverride === 'pausing') {
             return this.controlResult('ok', group);
         }
@@ -459,6 +478,8 @@ export class DownloadTaskQueue {
         if (group.stateOverride === 'cancelling' || group.stateOverride === 'cancelled') {
             return this.controlResult('terminal', group);
         }
+        if (this.userPaused) return this.controlResult('blocked', group);
+        if (this.getScopedUserPause(group)) this.scopeResumeOverrides.add(group.id);
         group.stateOverride = undefined;
         group.updatedAt = this.nextGroupVersion(group);
         this.notifyGroup(group);
@@ -478,15 +499,21 @@ export class DownloadTaskQueue {
         }
         if (this.snapshotGroup(group).state === 'completed') return this.controlResult('terminal', group);
 
+        this.cancelGroupTasks(group, reason);
+        this.processNext();
+        return this.controlResult('ok', group);
+    }
+
+    private cancelGroupTasks(group: DownloadTaskGroupRecord, reason: string): void {
         group.stateOverride = 'cancelling';
-        group.updatedAt = this.nextGroupVersion(group);
+        this.scopeResumeOverrides.delete(group.id);
         const removed: DownloadFileTask[] = [];
         this.queue = this.queue.filter(task => {
             if (task.groupId !== group.id) return true;
             removed.push(task);
             return false;
         });
-        for (const task of removed) this.settlePendingCancellation(task, reason);
+        for (const task of removed) this.settlePendingCancellation(task, reason, false);
         for (const task of this.active) {
             if (task.groupId === group.id && !task.abortController.signal.aborted) {
                 task.error = reason;
@@ -494,9 +521,8 @@ export class DownloadTaskQueue {
             }
         }
         if (!this.hasActiveGroupTask(group.id)) group.stateOverride = 'cancelled';
+        group.updatedAt = this.nextGroupVersion(group);
         this.notifyGroup(group);
-        this.processNext();
-        return this.controlResult('ok', group);
     }
 
     pauseAll(reason = '用户已暂停下载队列', origin: DownloadTaskPauseOrigin = 'user'): { active: number; pending: number; total: number } {
@@ -530,6 +556,9 @@ export class DownloadTaskQueue {
 
     pauseScope(scope: DownloadTaskScope, reason = '用户已暂停当前聊天下载队列'): { active: number; pending: number; total: number } {
         this.scopedUserPauses.set(this.scopePauseKey(scope), { scope: { ...scope }, reason });
+        for (const group of this.groups.values()) {
+            if (this.matchesScope(group, scope)) this.scopeResumeOverrides.delete(group.id);
+        }
         this.notifyGroups(scope);
         return this.countsForScope(scope);
     }
@@ -627,40 +656,24 @@ export class DownloadTaskQueue {
     }
 
     cancelScope(scope: DownloadTaskScope, reason = '用户取消当前聊天任务'): { active: number; pending: number; total: number } {
-        let active = 0;
-        let pending = 0;
-        const groupIds = Array.from(this.groups.values())
-            .filter(group => this.matchesScope(group, scope))
-            .map(group => group.id);
-        for (const groupId of groupIds) {
-            const result = this.cancelGroup(groupId, scope, reason, true);
-            if (result.status !== 'ok') continue;
-            active += result.active;
-            pending += result.pending;
+        const counts = this.countsForScope(scope);
+        for (const group of this.groups.values()) {
+            if (!this.matchesScope(group, scope)) continue;
+            if (['completed', 'cancelled', 'cancelling'].includes(this.snapshotGroup(group).state)) continue;
+            this.cancelGroupTasks(group, reason);
         }
         this.scopedUserPauses.delete(this.scopePauseKey(scope));
         this.processNext();
-        return { active, pending, total: active + pending };
+        return counts;
     }
 
     forceStopAll(reason = '用户强制停止'): { active: number; pending: number; total: number } {
-        const active = this.active.length;
-        const pending = this.queue.length;
-        const touchedGroups = new Set([...this.active, ...this.queue].map(task => task.groupId));
-        const removed = this.queue.splice(0);
-        for (const task of removed) this.settlePendingCancellation(task, reason);
-        for (const task of this.active) {
-            task.error = reason;
-            if (!task.abortController.signal.aborted) task.abortController.abort(reason);
+        const counts = this.counts();
+        for (const group of this.groups.values()) {
+            if (['completed', 'cancelled', 'cancelling'].includes(this.snapshotGroup(group).state)) continue;
+            this.cancelGroupTasks(group, reason);
         }
-        for (const groupId of touchedGroups) {
-            const group = this.groups.get(groupId);
-            if (!group) continue;
-            group.stateOverride = this.hasActiveGroupTask(groupId) ? 'cancelling' : 'cancelled';
-            group.updatedAt = this.nextGroupVersion(group);
-            this.notifyGroup(group);
-        }
-        return { active, pending, total: active + pending };
+        return counts;
     }
 
     private processNext(): void {
@@ -678,7 +691,7 @@ export class DownloadTaskQueue {
         }
     }
 
-    private settlePendingCancellation(task: DownloadFileTask, reason: string): void {
+    private settlePendingCancellation(task: DownloadFileTask, reason: string, notify = true): void {
         task.status = 'cancelled';
         task.error = reason;
         task.endTime = Date.now();
@@ -686,15 +699,15 @@ export class DownloadTaskQueue {
         if (group) {
             group.cancelled += 1;
             group.updatedAt = this.nextGroupVersion(group, task.endTime);
-            this.notifyGroup(group);
         }
+        this.pushHistory(task);
+        if (group && notify) this.notifyGroup(group);
         task.settleCancelled?.();
         if (task.onPendingCancelled) {
-            void Promise.resolve(task.onPendingCancelled()).catch(error => {
+            void Promise.resolve().then(() => task.onPendingCancelled!()).catch(error => {
                 console.error(`[Queue] pending cancellation callback failed: ${task.fileName}`, error);
             });
         }
-        this.pushHistory(task);
     }
 
     private removeHistoryTask(task: DownloadFileTask): void {
@@ -709,6 +722,7 @@ export class DownloadTaskQueue {
             .sort((a, b) => a.updatedAt - b.updatedAt);
         for (const group of terminal.slice(0, Math.max(0, this.groups.size - 500))) {
             this.groups.delete(group.id);
+            this.scopeResumeOverrides.delete(group.id);
         }
     }
 
@@ -794,20 +808,9 @@ export class DownloadTaskQueue {
         return undefined;
     }
 
-    private snapshotForDisplay(group: DownloadTaskGroupRecord): DownloadTaskGroupSnapshot {
-        const snapshot = this.snapshotGroup(group);
-        const scopedPause = this.getScopedUserPause(group);
-        if ((this.isGloballyPaused() || scopedPause) && snapshot.state === 'waiting') snapshot.state = 'paused';
-        snapshot.reason = this.systemPause
-            ? this.systemPause.reason
-            : scopedPause?.reason || (this.userPaused ? '用户已暂停下载队列' : snapshot.reason);
-        snapshot.systemPause = this.systemPause;
-        return snapshot;
-    }
-
     private notifyGroup(group: DownloadTaskGroupRecord): void {
         if (!this.onGroupChanged) return;
-        const snapshot = this.snapshotForDisplay(group);
+        const snapshot = this.snapshotGroup(group);
         const previous = this.notificationChains.get(group.id) || Promise.resolve();
         const next = previous
             .catch(() => undefined)
@@ -823,7 +826,10 @@ export class DownloadTaskQueue {
 
     private notifyGroups(scope: DownloadTaskScope = {}): void {
         for (const group of this.groups.values()) {
-            if (this.matchesScope(group, scope)) this.notifyGroup(group);
+            if (this.matchesScope(group, scope)) {
+                group.updatedAt = this.nextGroupVersion(group);
+                this.notifyGroup(group);
+            }
         }
     }
 
@@ -833,17 +839,21 @@ export class DownloadTaskQueue {
         const settled = group.completed + group.failed + group.cancelled;
         const total = Math.max(group.expectedTotal, activeTasks.length + pendingTasks.length + settled);
         let state: DownloadTaskGroupState;
-        if (group.stateOverride) {
+        if (group.stateOverride === 'cancelled' || group.stateOverride === 'cancelling') {
+            state = group.stateOverride;
+        } else if (settled > 0 && settled >= total && activeTasks.length === 0 && pendingTasks.length === 0) {
+            state = 'completed';
+        } else if (group.stateOverride) {
             state = group.stateOverride;
         } else if (activeTasks.length > 0) {
             state = 'running';
         } else if (pendingTasks.length > 0 || settled < total) {
             state = 'waiting';
         } else {
-            state = 'completed';
+            state = settled > 0 ? 'completed' : 'waiting';
         }
         const scopedPause = this.getScopedUserPause(group);
-        if ((this.isGloballyPaused() || scopedPause) && state === 'waiting' && pendingTasks.length > 0) {
+        if ((this.isGloballyPaused() || scopedPause) && ['running', 'waiting', 'pausing'].includes(state)) {
             state = 'paused';
         }
         return {
@@ -871,12 +881,11 @@ export class DownloadTaskQueue {
             speedBytesPerSecond: ['running', 'pausing'].includes(state) ? activeTasks.reduce((sum, task) => sum + (task.speedSampler?.speed(Date.now()) || 0), 0) : 0,
             speedUpdatedAt: Date.now(),
             currentFileName: activeTasks[0]?.fileName,
-            reason: this.systemPause
-                ? this.systemPause.reason
-                : state === 'paused' && (scopedPause || this.userPaused)
-                    ? scopedPause?.reason || '用户已暂停下载队列'
-                    : undefined,
-            systemPause: this.systemPause,
+            reason: !['completed', 'cancelled'].includes(state)
+                ? this.systemPause?.reason || (state === 'paused' && (scopedPause || this.userPaused)
+                    ? scopedPause?.reason || '用户已暂停下载队列' : undefined)
+                : undefined,
+            systemPause: ['completed', 'cancelled'].includes(state) ? undefined : this.systemPause,
             createdAt: group.createdAt,
             updatedAt: group.updatedAt,
         };
@@ -907,6 +916,7 @@ export class DownloadTaskQueue {
     }
 
     private getScopedUserPause(scope: DownloadTaskScope): { scope: DownloadTaskScope; reason: string } | undefined {
+        if ('id' in scope && this.scopeResumeOverrides.has(String(scope.id))) return undefined;
         for (const pause of this.scopedUserPauses.values()) {
             const chatMatches = pause.scope.chatId === undefined || pause.scope.chatId === scope.chatId;
             const userMatches = pause.scope.userId === undefined || pause.scope.userId === scope.userId;
@@ -934,7 +944,6 @@ export class DownloadTaskQueue {
         const group = candidates[0];
         const state = this.snapshotGroup(group).state;
         if (state === 'completed' || state === 'cancelled') {
-            if (!this.history.some(task => task.groupId === group.id && task.status === 'failed')) this.groups.delete(group.id);
             return { status: 'terminal', record: group };
         }
         return { status: 'ok', record: group };

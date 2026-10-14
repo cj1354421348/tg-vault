@@ -46,6 +46,9 @@
 .settings-action-row > button { flex: 0 1 auto; }
 .settings-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
 .settings-actions > :is(button, select) { max-width: 100%; }
+.settings-actions--bot { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: stretch; }
+.settings-actions--bot > button { min-width: 0; padding-inline: 8px; white-space: normal; overflow-wrap: anywhere; }
+.settings-actions--bot > .tv-btn-destructive { grid-column: 1 / -1; }
 .settings-choice-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
 .settings-provider-block { padding: 16px 18px; border-bottom: 1px solid hsl(var(--border)); background: hsl(var(--muted) / .25); }
 .settings-storage-account { display: flex; flex-direction: column; align-items: stretch; gap: 12px; min-width: 0; padding: 14px; border: 1px solid hsl(var(--border)); border-radius: var(--tv-radius-control); }
@@ -76,6 +79,8 @@
 .settings-metric { min-width: 0; padding: 13px 14px; border-inline-end: 1px solid hsl(var(--border)); border-bottom: 1px solid hsl(var(--border)); }
 .settings-metric:nth-child(2n) { border-inline-end: 0; }
 .settings-metric:nth-last-child(-n+2) { border-bottom: 0; }
+.settings-metrics > .settings-metric:last-child:nth-child(odd) { grid-column: 1 / -1; border-inline-end: 0; }
+.settings-metrics:has(> .settings-metric:nth-child(3):last-child) > .settings-metric:nth-child(2) { border-bottom: 1px solid hsl(var(--border)); }
 .settings-metric__label { margin-bottom: 6px; font-size: var(--tv-text-meta); color: hsl(var(--muted-foreground)); overflow-wrap: anywhere; }
 .settings-metric__value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.4; }
 .settings-metric__denominator { margin-inline-start: 6px; font-size: var(--tv-text-body); font-weight: 400; color: hsl(var(--muted-foreground)); }
@@ -131,14 +136,14 @@
   .settings-row__action { flex: 0 1 46%; justify-content: flex-end; }
   .settings-storage-account { flex-direction: row; align-items: center; justify-content: space-between; }
   .settings-bot-overview { grid-template-columns: minmax(0, 1fr) minmax(0, .8fr); }
-  .settings-actions--bot { justify-content: flex-end; }
 }
 @container settings-section (min-width: 900px) {
   .settings-form-layout { grid-template-columns: minmax(0, 1fr) 280px; grid-template-areas: 'fields guide'; align-items: start; }
   .settings-telegram__workspace { grid-template-columns: minmax(0, 1fr) 260px; }
   .settings-telegram__workspace > .settings-guide { grid-column: 2; grid-row: 1; }
   .settings-telegram__workspace > :not(.settings-guide) { grid-column: 1; grid-row: 1; }
-  .settings-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .settings-metrics { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+  .settings-metrics > .settings-metric:last-child:nth-child(odd) { grid-column: auto; }
   .settings-metric { border-bottom: 0; }
   .settings-metric:nth-child(2) { border-inline-end: 1px solid hsl(var(--border)); }
 }
@@ -149,7 +154,7 @@
   .settings-row, .settings-provider-block, .settings-inset, .settings-form-layout, .settings-telegram, .settings-login__header, .settings-login__body { padding: 16px; }
   .settings-local { padding: 0 16px 16px; }
   .settings-group, .settings-workspace, .settings-workspace__main { gap: 14px; }
-  .settings-actions--bot > button, .settings-actions--cleanup > :is(select, button) { flex: 1 1 140px; }
+  .settings-actions--cleanup > :is(select, button) { flex: 1 1 140px; }
   .settings-telegram-account__actions > button { flex: 1 1 140px; }
   .settings-action-row > button { flex: 1 1 180px; }
   .settings-choice-actions { grid-template-columns: minmax(0, 1fr); }

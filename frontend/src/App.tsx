@@ -195,7 +195,6 @@ function App() {
   // 移动状态
   const [movingFile, setMovingFile] = useState<FileData | null>(null);
   const [movingFolder, setMovingFolder] = useState<string | null>(null);
-  const [isFoldersExpanded, setIsFoldersExpanded] = useState(false); // folder section starts collapsed
 
   const [isCreateFolderModalOpen, setIsCreateFolderModalOpen] = useState(false);
 
@@ -209,9 +208,6 @@ function App() {
   const [isSelectionMode, setIsSelectionMode] = useState(false);
   const [selectedFileIds, setSelectedFileIds] = useState<string[]>([]);
   const [selectedFolderNames, setSelectedFolderNames] = useState<string[]>([]);
-
-  // 响应式列数监听
-  const [columns, setColumns] = useState(() => window.innerWidth <= 480 ? 1 : window.innerWidth <= 1200 ? 2 : window.innerWidth < 1600 ? 3 : 4);
 
   const clearFileInteractionState = useCallback(() => {
     setIsSelectionMode(false);
@@ -301,21 +297,6 @@ function App() {
       }
       return [];
     }
-  }, []);
-
-  useEffect(() => {
-    const updateColumns = () => {
-      const width = window.innerWidth;
-      // Match files.css exactly, including the inclusive mobile breakpoints.
-      if (width <= 480) setColumns(1);
-      else if (width <= 1200) setColumns(2);
-      else if (width < 1600) setColumns(3);
-      else setColumns(4);
-    };
-
-    updateColumns();
-    window.addEventListener('resize', updateColumns);
-    return () => window.removeEventListener('resize', updateColumns);
   }, []);
 
   useEffect(() => {
@@ -1071,14 +1052,6 @@ function App() {
     });
   }, [currentCategory, currentFolder, folderAggregations, sortConfig]);
 
-  const folderColumns = viewMode === 'list' ? 1 : columns;
-  const visibleFolders = useMemo(() => {
-    if (isFoldersExpanded) return folders;
-    return folders.slice(0, folderColumns);
-  }, [folders, isFoldersExpanded, folderColumns]);
-
-  const showFolderToggle = folders.length > folderColumns;
-
   // The API already returns a globally sorted cursor page. Preserve that order.
   const looseFiles = useMemo(() => {
     return filteredFiles.filter(file => file.name !== '.folder');
@@ -1275,10 +1248,6 @@ function App() {
               onCreateFolder={() => setIsCreateFolderModalOpen(true)}
               onNavigateFolder={navigateFolder}
               folders={folders}
-              visibleFolders={visibleFolders}
-              isFoldersExpanded={isFoldersExpanded}
-              showFolderToggle={showFolderToggle}
-              onToggleFolders={() => setIsFoldersExpanded(expanded => !expanded)}
               renderedFiles={renderedFiles}
               displayedFileCount={displayedFileSource.length}
               loading={loading}
@@ -1308,10 +1277,10 @@ function App() {
                 onFile: toggleFileSelection,
                 onFolder: toggleFolderSelection,
                 onSelectVisible: selected => {
-                  // Only the current rendered window and expanded folder rows;
+                  // Only the current rendered file window and displayed folders;
                   // never imply selection of unloaded cursor results.
                   const visibleFileIds = renderedFiles.map(file => file.id);
-                  const visibleFolderNames = visibleFolders.map(folder => folder.name);
+                  const visibleFolderNames = folders.map(folder => folder.name);
                   setSelectedFileIds(current => selected
                     ? Array.from(new Set([...current, ...visibleFileIds]))
                     : current.filter(id => !visibleFileIds.includes(id)));

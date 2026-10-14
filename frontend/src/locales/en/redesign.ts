@@ -6,8 +6,6 @@ export const redesign = {
     "selectVisible": "Select visible items",
     "loadedFileCount_one": "{{count}} file loaded",
     "loadedFileCount_other": "{{count}} files loaded",
-    "collapseFolders": "Collapse folders",
-    "expandFolders": "Expand folders",
     "moveSingleOnly": "Select one file or folder to move"
   },
   "tasks": {

@@ -239,7 +239,7 @@ class FileAPI {
         return tasksClient.getTasks(filters);
     }
 
-    async controlTask(sourceType: UnifiedTaskSource, id: string, action: 'cancel' | 'retry'): Promise<void> {
+    async controlTask(sourceType: UnifiedTaskSource, id: string, action: 'cancel' | 'retry' | 'pause' | 'resume'): Promise<void> {
         return tasksClient.controlTask(sourceType, id, action);
     }
 

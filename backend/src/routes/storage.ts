@@ -28,6 +28,7 @@ import { StorageProbeError } from '../services/storage.js';
 import { getTelegramUserClientStatus } from '../services/telegramUserClientStatus.js';
 import { getTelegramBotStatus } from '../services/telegramBotStatus.js';
 import { formatBytes } from '../utils/fileMetadata.js';
+import { buildStorageAccountDetails } from '../utils/storageAccountDetails.js';
 import {
     applyEffectiveTelegramBotConfig,
     deleteTelegramBotConfig,
@@ -534,9 +535,9 @@ router.get('/config/telegram-user', requireAuth, async (_req: Request, res: Resp
 router.get('/config/telegram-user/accounts', requireAuth, async (_req: Request, res: Response) => {
     noStore(res);
     const accounts = await telegramAccountRepository.listAccounts();
-    const publicAccounts = await Promise.all(accounts.map(async account => {
-    const permissions = await telegramAccountRepository.listAccessForAccount(account.id);
-        const permissionSummary = await telegramAccountRepository.getAccessSummaryForAccount(account.id);
+    const accessByAccount = await telegramAccountRepository.listAccessForAccounts(accounts.map(account => account.id));
+    const publicAccounts = accounts.map(account => {
+        const { permissions, summary: permissionSummary } = accessByAccount.get(account.id)!;
         const allowed = permissionSummary.allowed;
         const denied = permissionSummary.denied;
         const unknown = permissionSummary.unknown;
@@ -556,7 +557,7 @@ router.get('/config/telegram-user/accounts', requireAuth, async (_req: Request, 
             permissions: permissions.map(row => ({ sourceId: row.sourceKey, sourceName: row.sourceKey, status: row.accessState, checkedAt: row.checkedAt?.toISOString?.() || null, reason: row.lastError })),
             scheduling: { weight: account.weight, activeDownloads: telegramUserClientPool.getActiveConnections(account.id), lastSelectedAt: null },
         };
-    }));
+    });
     const aggregate = publicAccounts.reduce((sum, row) => ({
         allowed: sum.allowed + row.permissionSummary.allowed,
         denied: sum.denied + row.permissionSummary.denied,
@@ -1095,6 +1096,47 @@ router.post('/switch', requireAuth, async (req: Request, res: Response) => {
     } catch (error) {
         console.error('切换存储失败:', error);
         sendStorageOperationError(res, error, '切换存储失败，当前默认账户未改变');
+    }
+});
+
+router.use('/accounts', (_req: Request, res: Response, next) => {
+    noStore(res);
+    next();
+});
+
+const STORAGE_ACCOUNT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+router.get('/accounts/:id/details', requireAuth, async (req: Request, res: Response) => {
+    const { id } = req.params;
+    if (!STORAGE_ACCOUNT_ID_PATTERN.test(id)) return res.status(400).json({ error: '无效的存储账户 ID' });
+    try {
+        const result = await query(
+            'SELECT id, name, type, is_active, created_at, updated_at, config FROM storage_accounts WHERE id = $1',
+            [id],
+        );
+        if (!result.rows[0]) return res.status(404).json({ error: '存储账户不存在' });
+        return res.json(buildStorageAccountDetails(result.rows[0]));
+    } catch {
+        return res.status(500).json({ error: '获取存储账户详情失败' });
+    }
+});
+
+router.patch('/accounts/:id', requireAuth, async (req: Request, res: Response) => {
+    const { id } = req.params;
+    if (!STORAGE_ACCOUNT_ID_PATTERN.test(id)) return res.status(400).json({ error: '无效的存储账户 ID' });
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    if (name.length < 1 || name.length > 100) {
+        return res.status(400).json({ error: '存储账户名称须为 1 至 100 个字符' });
+    }
+    try {
+        const result = await query(
+            'UPDATE storage_accounts SET name = $1, updated_at = NOW() WHERE id = $2 RETURNING id, name',
+            [name, id],
+        );
+        if (!result.rows[0]) return res.status(404).json({ error: '存储账户不存在' });
+        return res.json({ success: true, id: result.rows[0].id, name: result.rows[0].name });
+    } catch {
+        return res.status(500).json({ error: '重命名存储账户失败' });
     }
 });
 

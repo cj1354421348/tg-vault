@@ -51,7 +51,7 @@ function makeClient(credentials: TelegramLoginCredentials): TelegramClient {
     });
 }
 
-class GramJsMultiAccountLoginClient implements TelegramMultiAccountLoginClient {
+export class GramJsMultiAccountLoginClient implements TelegramMultiAccountLoginClient {
     private qrHandler: (() => void | Promise<void>) | null = null;
     private readonly qrEvent = new Raw({ types: [Api.UpdateLoginToken] });
 
@@ -114,7 +114,15 @@ class GramJsMultiAccountLoginClient implements TelegramMultiAccountLoginClient {
         let imported: Api.auth.TypeLoginToken = result;
         if (result instanceof Api.auth.LoginTokenMigrateTo) {
             await this.client._switchDC(result.dcId);
-            imported = await this.client.invoke(new Api.auth.ImportLoginToken({ token: result.token })) as Api.auth.TypeLoginToken;
+            try {
+                imported = await this.client.invoke(new Api.auth.ImportLoginToken({ token: result.token })) as Api.auth.TypeLoginToken;
+            } catch (error) {
+                // The destination DC can require 2FA after accepting the scanned token.
+                if (this.errorName(error).includes('SESSION_PASSWORD_NEEDED')) {
+                    return { kind: 'password_required' };
+                }
+                throw error;
+            }
         }
         if (imported instanceof Api.auth.LoginTokenSuccess) return { kind: 'authorized' };
         if (imported instanceof Api.auth.LoginToken) {

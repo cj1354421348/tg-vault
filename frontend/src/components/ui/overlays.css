@@ -89,7 +89,7 @@
 }
 .tv-modal-field { padding: 10px 12px; }
 .tv-modal-field:focus,
-.tv-input-group:focus-within { border-color: hsl(var(--primary)); outline: 3px solid hsl(var(--primary) / .2); outline-offset: 0; }
+.tv-input-group:focus-within { border-color: hsl(var(--primary)); outline: 2px solid hsl(var(--ring)); outline-offset: 2px; box-shadow: none; }
 .tv-modal-field::placeholder,
 .tv-input-group__input::placeholder { color: hsl(var(--muted-foreground)); opacity: 1; }
 .tv-modal-field:disabled,

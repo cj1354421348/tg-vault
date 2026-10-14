@@ -111,8 +111,9 @@ export class TelegramUserWebLoginFlows<C extends TelegramUserLoginClient> {
                 flow.step = 'password';
                 return { step: 'password_required' };
             }
-            await this.recordError(flow);
-            throw this.publicError(error, 'INVALID_CODE');
+            const failure = this.publicError(error);
+            if (failure.code === 'INVALID_CODE') await this.recordError(flow);
+            throw failure;
         }
     }
 
@@ -123,8 +124,9 @@ export class TelegramUserWebLoginFlows<C extends TelegramUserLoginClient> {
             await flow.client.signInPassword(password);
             return await this.complete(flow);
         } catch (error) {
-            await this.recordError(flow);
-            throw this.publicError(error, 'INVALID_PASSWORD');
+            const failure = this.publicError(error);
+            if (failure.code === 'INVALID_PASSWORD') await this.recordError(flow);
+            throw failure;
         }
     }
 
@@ -168,13 +170,13 @@ export class TelegramUserWebLoginFlows<C extends TelegramUserLoginClient> {
         flow.errors += 1;
     }
 
-    private publicError(error: unknown, fallback: TelegramUserLoginFlowErrorCode = 'TELEGRAM_ERROR'): TelegramUserLoginFlowError {
+    private publicError(error: unknown): TelegramUserLoginFlowError {
         if (error instanceof TelegramUserLoginFlowError) return error;
         const name = telegramErrorName(error);
         if (/PHONE_CODE_(INVALID|EXPIRED|EMPTY)/.test(name)) return new TelegramUserLoginFlowError('INVALID_CODE', '验证码无效或已过期');
         if (/PASSWORD_HASH_INVALID/.test(name)) return new TelegramUserLoginFlowError('INVALID_PASSWORD', '两步验证密码错误');
         if (/PHONE_NUMBER_INVALID/.test(name)) return new TelegramUserLoginFlowError('INVALID_PHONE', '手机号无效');
-        return new TelegramUserLoginFlowError(fallback, fallback === 'INVALID_PASSWORD' ? '两步验证密码错误' : fallback === 'INVALID_CODE' ? '验证码无效或已过期' : 'Telegram 登录失败，请稍后重试');
+        return new TelegramUserLoginFlowError('TELEGRAM_ERROR', 'Telegram 登录失败，请稍后重试');
     }
 
     private async closeClient(client: C): Promise<void> {

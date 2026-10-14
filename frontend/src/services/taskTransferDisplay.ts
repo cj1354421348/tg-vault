@@ -3,7 +3,8 @@ import { formatBytes } from './formatBytes';
 
 /** Render server samples, never estimate transfer speed from browser polling. */
 export function taskTransferDisplay(task: UnifiedTask) {
-    const downloading = task.status === 'running' && task.stage === 'downloading';
+    const downloading = ['running', 'pausing'].includes(task.status)
+        && (task.sourceType === 'telegram_channel' ? Number(task.detail.active) > 0 : task.stage === 'downloading');
     const sample = task.detail.speedBytesPerSecond;
     const speed = downloading && typeof sample === 'number' && Number.isFinite(sample) && sample >= 0
         ? `${formatBytes(sample)}/s`
@@ -12,8 +13,10 @@ export function taskTransferDisplay(task: UnifiedTask) {
     const total = Number.isFinite(task.bytes.total) ? Math.max(0, task.bytes.total) : 0;
     return {
         speed,
-        showBytes: total > 0 || transferred > 0 || downloading,
-        transferred: formatBytes(transferred),
-        total: total > 0 ? formatBytes(total) : '—',
+        showBytes: task.sourceType === 'telegram_channel'
+            ? total > 0 || transferred > 0
+            : task.detail.bytesKnown !== false && (total > 0 || transferred > 0 || downloading),
+        transferred: `${formatBytes(transferred)}${task.detail.savedBytesKnown === false ? '+' : ''}`,
+        total: total > 0 ? `${formatBytes(total)}${task.detail.bytesKnown === false ? '+' : ''}` : '—',
     };
 }

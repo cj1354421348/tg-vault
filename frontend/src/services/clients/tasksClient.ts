@@ -30,7 +30,7 @@ export class TasksClient {
         return response.json();
     }
 
-    async controlTask(sourceType: UnifiedTaskSource, id: string, action: 'cancel' | 'retry'): Promise<void> {
+    async controlTask(sourceType: UnifiedTaskSource, id: string, action: 'cancel' | 'retry' | 'pause' | 'resume'): Promise<void> {
         const sourcePath = encodeURIComponent(sourceType);
         const taskPath = encodeURIComponent(id);
         let confirmationToken: string | undefined;

@@ -5,12 +5,15 @@ import type {
     TelegramUserAccountRecord,
 } from './telegramAccountRepository.js';
 import { telegramAccountRepository } from './telegramAccountRepository.js';
-import { TelegramClient } from 'telegram';
+import { TelegramClient, utils } from 'telegram';
+import type { Api } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { decryptCredential } from '../utils/credentialCrypto.js';
 import {
     selectWeightedLeastConnectedTelegramAccount,
+    normalizeTelegramAccountSourceKey,
     type TelegramAccountSchedulingOptions,
+    type TelegramAccountSchedulingCandidate,
     type TelegramSourceAccessState,
 } from './telegramAccountScheduler.js';
 
@@ -26,6 +29,7 @@ export interface TelegramPooledClient {
     getMe(): Promise<unknown>;
     disconnect(): Promise<unknown>;
     destroy(): Promise<unknown>;
+    invoke?<R extends Api.AnyRequest>(request: R, dcId?: number): Promise<R['__response']>;
 }
 
 interface PoolRepository extends Pick<TelegramAccountRepository,
@@ -36,22 +40,33 @@ interface PoolRepository extends Pick<TelegramAccountRepository,
     | 'updateSession'
     | 'recordHealthy'
     | 'recordFailure'
-    | 'markSessionExpired'> {}
+    | 'markSessionExpired'
+    | 'markCooldown'
+    | 'markSourceAccess'> {}
 
 interface PoolEntry<C extends TelegramPooledClient> {
     account: TelegramUserAccountRecord;
     client: C;
-    activeConnections: number;
+    active: Record<TelegramAccountSourceScope, number>;
+    lastSelected: Record<TelegramAccountSourceScope, number>;
+    concurrencyLimit: number;
+    stableSince: number;
+    scanIntervalMs: number;
+    lastScanStartedAt?: number;
+    scanSuccessSince?: number;
+    lastScanSucceededAt?: number;
 }
 
 export interface SelectedTelegramDownloadAccount<C extends TelegramPooledClient = TelegramPooledClient> {
     accountId: string;
     client: C;
     release(): void;
+    generation: number;
 }
 
 export interface TelegramAccountSelectionOptions extends TelegramAccountSchedulingOptions {
     scope?: TelegramAccountSourceScope;
+    signal?: AbortSignal;
 }
 
 export type PublicTelegramUserAccount = Omit<TelegramUserAccountRecord, 'session'> & {
@@ -59,13 +74,46 @@ export type PublicTelegramUserAccount = Omit<TelegramUserAccountRecord, 'session
     activeConnections: number;
 };
 
+export class NoEligibleTelegramAccountError extends Error {
+    constructor(sourceKey: string, scope: TelegramAccountSourceScope) {
+        super(`No eligible Telegram account for ${scope}: ${sourceKey}`);
+        this.name = 'NoEligibleTelegramAccountError';
+    }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+    signal?.throwIfAborted();
+}
+
+const ACCOUNT_RECOVERY_INTERVAL_MS = 60_000;
+const ACCOUNT_WAIT_RECHECK_MS = 1_000;
+const SCAN_INTERVAL_MS = 1_000;
+const SCAN_MAX_INTERVAL_MS = 60_000;
+const SCAN_RECOVERY_INTERVAL_MS = 10 * 60_000;
+
 function errorName(error: unknown): string {
     const value = error as { errorMessage?: unknown; message?: unknown } | null;
     return String(value?.errorMessage || value?.message || error || 'Telegram account connection failed');
 }
 
 export function isTelegramSessionExpiredError(error: unknown): boolean {
-    return /(AUTH_KEY_UNREGISTERED|SESSION_(REVOKED|EXPIRED)|USER_DEACTIVATED|SESSION_EXPIRED)/i.test(errorName(error));
+    return /(AUTH_KEY_(UNREGISTERED|INVALID|DUPLICATED)|SESSION_(REVOKED|EXPIRED)|USER_DEACTIVATED)/i.test(errorName(error));
+}
+
+export function classifyTelegramDownloadAccountError(error: unknown): 'session_expired' | 'permission_denied' | 'flood_wait' | 'retryable' {
+    const value = error as { errorMessage?: unknown; message?: unknown; name?: unknown } | null;
+    const text = `${value?.errorMessage || ''} ${value?.message || ''} ${value?.name || ''}`;
+    if (isTelegramSessionExpiredError(error)) return 'session_expired';
+    if (/CHANNEL_PRIVATE|USER_NOT_PARTICIPANT|USER_BANNED_IN_CHANNEL|CHAT_FORBIDDEN|CHAT_ADMIN_REQUIRED|Could not find the input entity|Cannot find any entity/i.test(text)) return 'permission_denied';
+    if (/FLOOD|Too many requests/i.test(text)) return 'flood_wait';
+    return 'retryable';
+}
+
+export function telegramFloodWaitSeconds(error: unknown): number {
+    const value = error as { errorMessage?: unknown; message?: unknown; seconds?: unknown; value?: unknown } | null;
+    const text = `${value?.errorMessage || ''} ${value?.message || ''}`;
+    const seconds = Number(value?.seconds || value?.value || text.match(/FLOOD(?:_PREMIUM)?_WAIT_?(\d+)/i)?.[1] || 60);
+    return Number.isFinite(seconds) ? Math.max(1, Math.ceil(seconds)) : 60;
 }
 
 export type TelegramUserActivationReason = 'login_complete' | 'explicit_enable';
@@ -74,12 +122,16 @@ export class TelegramUserClientPool<C extends TelegramPooledClient = TelegramPoo
     private readonly entries = new Map<string, PoolEntry<C>>();
     private credentials: TelegramPoolCredentials | null = null;
     private initializationTail: Promise<void> = Promise.resolve();
+    private selectionSequence = 0;
+    private readonly waiters = new Set<() => void>();
+    private readonly pendingAccessDenials = new Map<string, number>();
 
     constructor(private readonly deps: {
         repository: PoolRepository;
         decryptSession(value: string): string;
         createClient(session: string, credentials: TelegramPoolCredentials, accountId: string): C;
         saveSession?(client: C): string;
+        now?(): number;
     }) {}
 
     async initialize(credentials: TelegramPoolCredentials): Promise<void> {
@@ -89,7 +141,16 @@ export class TelegramUserClientPool<C extends TelegramPooledClient = TelegramPoo
             this.credentials = credentials;
             await this.deps.repository.migrateLegacySystemSettings();
             const accounts = await this.deps.repository.listEnabledAccounts();
+            const enabledIds = new Set(accounts.filter(account => account.healthState !== 'session_expired').map(account => account.id));
+            await Promise.all([...this.entries.keys()].filter(id => !enabledIds.has(id)).map(id => this.expireEntry(id)));
+            for (const account of accounts) {
+                const entry = this.entries.get(account.id);
+                if (!entry) continue;
+                entry.account = account;
+                entry.concurrencyLimit = Math.min(entry.concurrencyLimit, Math.max(1, account.maxConnections));
+            }
             await Promise.allSettled(accounts.map(account => this.connectAccount(account)));
+            this.wakeWaiters();
         });
         this.initializationTail = run.catch(() => undefined);
         await run;
@@ -138,45 +199,222 @@ export class TelegramUserClientPool<C extends TelegramPooledClient = TelegramPoo
             this.entries.set(account.id, {
                 account: { ...account, healthState: 'healthy', lastError: null },
                 client,
-                activeConnections: 0,
+                active: { download: 0, scan: 0, metadata: 0 },
+                lastSelected: { download: 0, scan: 0, metadata: 0 },
+                concurrencyLimit: Math.max(1, account.maxConnections),
+                stableSince: this.now(),
+                scanIntervalMs: account.cooldownUntil && account.cooldownUntil.getTime() > this.now() ? SCAN_INTERVAL_MS * 2 : SCAN_INTERVAL_MS,
             });
+            this.wakeWaiters();
         } catch (error) {
             if (client) await this.closeClient(client);
             const message = errorName(error);
             if (isTelegramSessionExpiredError(error)) await this.deps.repository.markSessionExpired(account.id, message);
-            else await this.deps.repository.recordFailure(account.id, message);
+            else if (classifyTelegramDownloadAccountError(error) === 'flood_wait') {
+                await this.deps.repository.markCooldown(account.id, telegramFloodWaitSeconds(error), message);
+            } else await this.deps.repository.recordFailure(account.id, message);
         }
     }
 
+    private now(): number { return this.deps.now?.() ?? Date.now(); }
+
+    private wakeWaiters(): void {
+        for (const wake of this.waiters) wake();
+    }
+
+    private waitForAvailability(signal?: AbortSignal, milliseconds = ACCOUNT_WAIT_RECHECK_MS): Promise<void> {
+        throwIfAborted(signal);
+        return new Promise<void>(resolve => {
+            const finish = () => {
+                clearTimeout(timer);
+                this.waiters.delete(finish);
+                signal?.removeEventListener('abort', finish);
+                resolve();
+            };
+            const timer = setTimeout(finish, milliseconds);
+            this.waiters.add(finish);
+            signal?.addEventListener('abort', finish, { once: true });
+            if (signal?.aborted) finish();
+        });
+    }
+
+    private async beginScanRequest(entry: PoolEntry<C>, signal?: AbortSignal): Promise<void> {
+        while (true) {
+            throwIfAborted(signal);
+            if (this.entries.get(entry.account.id) !== entry || !entry.account.enabled || entry.client.connected === false) {
+                throw new NoEligibleTelegramAccountError(entry.account.id, 'scan');
+            }
+            const now = this.now();
+            const readyAt = Math.max(entry.account.cooldownUntil?.getTime() || 0,
+                entry.lastScanStartedAt === undefined ? 0 : entry.lastScanStartedAt + entry.scanIntervalMs);
+            if (now >= readyAt) {
+                entry.lastScanStartedAt = now;
+                return;
+            }
+            await this.waitForAvailability(signal, readyAt - now);
+        }
+    }
+
+    private recordSuccessfulScanRequest(entry: PoolEntry<C>): void {
+        const now = this.now();
+        if (this.entries.get(entry.account.id) !== entry || now < (entry.account.cooldownUntil?.getTime() || 0)) return;
+        // Idle time is not evidence that the reduced rate is safe.
+        if (entry.lastScanSucceededAt === undefined || now - entry.lastScanSucceededAt > Math.max(60_000, entry.scanIntervalMs * 2)) {
+            entry.scanSuccessSince = now;
+        }
+        entry.lastScanSucceededAt = now;
+        entry.scanSuccessSince ??= now;
+        if (now - entry.scanSuccessSince >= SCAN_RECOVERY_INTERVAL_MS) {
+            entry.scanIntervalMs = Math.max(SCAN_INTERVAL_MS, entry.scanIntervalMs / 2);
+            entry.scanSuccessSince = now;
+            this.wakeWaiters();
+        }
+    }
+
+    private scanClient(entry: PoolEntry<C>, signal?: AbortSignal): C {
+        let invoke: C['invoke'];
+        // A per-operation view keeps downloads untouched and also catches RPCs
+        // made inside getMessages (entity resolution and internal pagination).
+        return new Proxy(entry.client, {
+            get: (target, property, receiver) => {
+                const value = Reflect.get(target, property, receiver);
+                if (property !== 'invoke' || typeof value !== 'function') return value;
+                invoke ??= async (...args: unknown[]) => {
+                    try {
+                        // Resolution may send a nested RPC; reserve the outer start
+                        // only after that finishes, not before its network lookup.
+                        if (target instanceof TelegramClient) {
+                            await (args[0] as Api.AnyRequest).resolve(receiver, utils);
+                        }
+                        await this.beginScanRequest(entry, signal);
+                        const result = await Reflect.apply(value, receiver, args);
+                        this.recordSuccessfulScanRequest(entry);
+                        return result;
+                    } catch (error) {
+                        entry.scanSuccessSince = undefined;
+                        entry.lastScanSucceededAt = undefined;
+                        throw error;
+                    }
+                };
+                return invoke;
+            },
+        });
+    }
+
     async select(sourceKey: string, options: TelegramAccountSelectionOptions = {}): Promise<SelectedTelegramDownloadAccount<C> | null> {
+        return (await this.selectAvailable(sourceKey, options)).lease;
+    }
+
+    private async selectAvailable(sourceKey: string, options: TelegramAccountSelectionOptions): Promise<{
+        lease: SelectedTelegramDownloadAccount<C> | null; viable: boolean;
+    }> {
+        throwIfAborted(options.signal);
         const scope = options.scope || 'download';
-        const access = await this.deps.repository.listSourceAccess(sourceKey, scope);
+        const access = await this.deps.repository.listSourceAccess(normalizeTelegramAccountSourceKey(sourceKey), scope);
+        throwIfAborted(options.signal);
         const accessByAccount = new Map<string, TelegramAccountSourceAccessRecord>(access.map(row => [row.accountId, row]));
-        const selected = selectWeightedLeastConnectedTelegramAccount([...this.entries.values()].map(entry => ({
+        const key = normalizeTelegramAccountSourceKey(sourceKey);
+        const excluded = new Set(options.excludeAccountIds || []);
+        const candidates = [...this.entries.values()].map<TelegramAccountSchedulingCandidate>(entry => ({
             accountId: entry.account.id,
-            enabled: entry.account.enabled,
+            enabled: entry.account.enabled && entry.client.connected !== false,
             healthState: entry.account.healthState,
             cooldownUntil: entry.account.cooldownUntil,
             weight: entry.account.weight,
             priority: entry.account.priority,
-            activeConnections: entry.activeConnections,
-            maxConnections: entry.account.maxConnections,
-            sourceAccessState: accessByAccount.get(entry.account.id)?.accessState || 'unknown',
-        })), options);
-        if (!selected) return null;
-        const entry = this.entries.get(selected.accountId);
-        if (!entry) return null;
-        entry.activeConnections += 1;
+            activeConnections: entry.active[scope],
+            maxConnections: scope === 'scan' ? 1 : entry.concurrencyLimit,
+            lastSelected: entry.lastSelected[scope],
+            sourceAccessState: this.pendingAccessDenials.has(JSON.stringify([entry.account.id, key, scope]))
+                ? 'denied' : accessByAccount.get(entry.account.id)?.accessState || 'unknown',
+        }));
+        const selected = selectWeightedLeastConnectedTelegramAccount(candidates, { ...options, now: options.now || new Date(this.now()), excludeAccountIds: excluded });
+        const viable = candidates.some(candidate => candidate.enabled && candidate.healthState !== 'session_expired'
+            && candidate.sourceAccessState !== 'denied' && !excluded.has(candidate.accountId));
+        const entry = selected && this.entries.get(selected.accountId);
+        if (!entry) return { lease: null, viable };
+        entry.active[scope] += 1;
+        entry.lastSelected[scope] = ++this.selectionSequence;
         let released = false;
-        return {
+        return { viable, lease: {
             accountId: entry.account.id,
-            client: entry.client,
+            client: scope === 'scan' ? this.scanClient(entry, options.signal) : entry.client,
+            generation: entry.stableSince,
             release: () => {
                 if (released) return;
                 released = true;
-                entry.activeConnections = Math.max(0, entry.activeConnections - 1);
+                entry.active[scope] = Math.max(0, entry.active[scope] - 1);
+                this.wakeWaiters();
             },
-        };
+        } };
+    }
+
+    async acquire(sourceKey: string, options: TelegramAccountSelectionOptions = {}): Promise<SelectedTelegramDownloadAccount<C>> {
+        while (true) {
+            const { lease, viable } = await this.selectAvailable(sourceKey, options);
+            if (lease) return lease;
+            if (!viable) throw new NoEligibleTelegramAccountError(sourceKey, options.scope || 'download');
+            await this.waitForAvailability(options.signal);
+            throwIfAborted(options.signal);
+        }
+    }
+
+    async withAccount<T>(
+        sourceKey: string,
+        scope: TelegramAccountSourceScope,
+        operation: (client: C, accountId: string) => Promise<T>,
+        options: { signal?: AbortSignal } = {},
+    ): Promise<T> {
+        const key = normalizeTelegramAccountSourceKey(sourceKey);
+        while (true) {
+            const lease = await this.acquire(key, { scope, signal: options.signal });
+            try {
+                throwIfAborted(options.signal);
+                const result = await operation(lease.client, lease.accountId);
+                throwIfAborted(options.signal);
+                if (scope !== 'scan') this.recordSuccessfulOperation(lease.accountId, lease.generation);
+                return result;
+            } catch (error) {
+                throwIfAborted(options.signal);
+                const classification = classifyTelegramDownloadAccountError(error);
+                const message = errorName(error);
+                if (classification === 'retryable') throw error;
+                if (classification === 'flood_wait') {
+                    const seconds = telegramFloodWaitSeconds(error);
+                    this.updateCooldown(lease.accountId, new Date(this.now() + seconds * 1000), message, scope);
+                    lease.release();
+                    await this.deps.repository.markCooldown(lease.accountId, seconds, message);
+                } else if (classification === 'permission_denied') {
+                    const denialKey = JSON.stringify([lease.accountId, key, scope]);
+                    this.pendingAccessDenials.set(denialKey, (this.pendingAccessDenials.get(denialKey) || 0) + 1);
+                    lease.release();
+                    try {
+                        await this.deps.repository.markSourceAccess(lease.accountId, key, scope, 'denied', message);
+                    } finally {
+                        const remaining = (this.pendingAccessDenials.get(denialKey) || 1) - 1;
+                        if (remaining) this.pendingAccessDenials.set(denialKey, remaining);
+                        else this.pendingAccessDenials.delete(denialKey);
+                    }
+                } else {
+                    const entry = this.entries.get(lease.accountId);
+                    if (entry) entry.account = { ...entry.account, healthState: 'session_expired' };
+                    lease.release();
+                    await this.deps.repository.markSessionExpired(lease.accountId, message);
+                    await this.expireAccount(lease.accountId);
+                }
+            } finally {
+                lease.release();
+            }
+        }
+    }
+
+    recordSuccessfulOperation(accountId: string, generation: number): void {
+        const entry = this.entries.get(accountId);
+        if (!entry || entry.stableSince !== generation || this.now() < (entry.account.cooldownUntil?.getTime() || 0)) return;
+        if (this.now() - entry.stableSince < ACCOUNT_RECOVERY_INTERVAL_MS) return;
+        entry.concurrencyLimit = Math.min(Math.max(1, entry.account.maxConnections), entry.concurrencyLimit + 1);
+        entry.stableSince = this.now();
+        this.wakeWaiters();
     }
 
     getDefaultClient(): C | null {
@@ -189,28 +427,41 @@ export class TelegramUserClientPool<C extends TelegramPooledClient = TelegramPoo
     }
 
     getActiveConnections(accountId: string): number {
-        return this.entries.get(accountId)?.activeConnections || 0;
+        return this.entries.get(accountId)?.active.download || 0;
     }
 
     getReadyAccountIds(): string[] {
         return [...this.entries.keys()];
     }
 
-    getRuntimeState(): Array<{ accountId: string; connected: boolean; activeConnections: number }> {
+    getRuntimeState(): Array<{ accountId: string; connected: boolean; activeConnections: number; activeScanConnections: number; activeMetadataConnections: number; concurrencyLimit: number }> {
         return [...this.entries.values()].map(entry => ({
             accountId: entry.account.id,
             connected: Boolean(entry.client.connected),
-            activeConnections: entry.activeConnections,
+            activeConnections: entry.active.download,
+            activeScanConnections: entry.active.scan,
+            activeMetadataConnections: entry.active.metadata,
+            concurrencyLimit: entry.concurrencyLimit,
         }));
     }
 
-    updateCooldown(accountId: string, cooldownUntil: Date, error: string | null): void {
+    updateCooldown(accountId: string, cooldownUntil: Date, error: string | null, scope: TelegramAccountSourceScope = 'download'): void {
         const entry = this.entries.get(accountId);
-        if (entry) entry.account = { ...entry.account, cooldownUntil, healthState: 'degraded', lastError: error };
+        if (entry) {
+            const until = new Date(Math.max(entry.account.cooldownUntil?.getTime() || 0, cooldownUntil.getTime()));
+            entry.account = { ...entry.account, cooldownUntil: until, healthState: 'degraded', lastError: error };
+            if (scope === 'scan') entry.scanIntervalMs = Math.min(SCAN_MAX_INTERVAL_MS, entry.scanIntervalMs * 2);
+            else entry.concurrencyLimit = Math.max(1, Math.floor(entry.concurrencyLimit / 2));
+            entry.scanSuccessSince = undefined;
+            entry.lastScanSucceededAt = undefined;
+            entry.stableSince = Math.max(this.now(), until.getTime());
+        }
+        this.wakeWaiters();
     }
 
     updateSourceAccess(_accountId: string, _sourceKey: string, _scope: TelegramAccountSourceScope, _state: TelegramSourceAccessState): void {
         // Source access is read through the repository for each selection, so no stale in-memory cache needs invalidation.
+        this.wakeWaiters();
     }
 
     async expireAccount(accountId: string): Promise<void> {
@@ -220,6 +471,7 @@ export class TelegramUserClientPool<C extends TelegramPooledClient = TelegramPoo
     private async expireEntry(accountId: string): Promise<void> {
         const entry = this.entries.get(accountId);
         this.entries.delete(accountId);
+        this.wakeWaiters();
         if (entry) await this.closeClient(entry.client);
     }
 
@@ -230,6 +482,7 @@ export class TelegramUserClientPool<C extends TelegramPooledClient = TelegramPoo
     private async shutdownEntries(): Promise<void> {
         const entries = [...this.entries.values()];
         this.entries.clear();
+        this.wakeWaiters();
         await Promise.all(entries.map(entry => this.closeClient(entry.client)));
     }
 
@@ -251,7 +504,7 @@ export const telegramUserClientPool = new TelegramUserClientPool<TelegramClient>
     createClient: (session, credentials) => new TelegramClient(
         new StringSession(session), credentials.apiId, credentials.apiHash, {
             connectionRetries: 15, retryDelay: 2000, useWSS: false,
-            deviceModel: 'TG Vault User Downloader', systemVersion: '1.0.0', appVersion: '1.0.0', floodSleepThreshold: 120,
+            deviceModel: 'TG Vault User Downloader', systemVersion: '1.0.0', appVersion: '1.0.0', floodSleepThreshold: 0,
         },
     ),
     saveSession: client => client.session.save() as unknown as string,
@@ -283,8 +536,9 @@ export async function selectTelegramDownloadAccount(sourceKey: string, options: 
 }
 
 export async function markTelegramAccountCooldown(accountId: string, seconds: number, error: string | null = null): Promise<boolean> {
-    const changed = await telegramAccountRepository.markCooldown(accountId, seconds, error);
-    if (changed) telegramUserClientPool.updateCooldown(accountId, new Date(Date.now() + Math.max(1, seconds) * 1000), error);
+    const safeSeconds = Number.isFinite(seconds) ? Math.max(1, Math.ceil(seconds)) : 60;
+    telegramUserClientPool.updateCooldown(accountId, new Date(Date.now() + safeSeconds * 1000), error);
+    const changed = await telegramAccountRepository.markCooldown(accountId, safeSeconds, error);
     return changed;
 }
 

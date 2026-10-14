@@ -335,7 +335,8 @@ export const PreviewModal = ({ file, onClose, onToggleFavorite, files = [], onNa
         onClose();
     };
 
-    const PreviewContent = () => {
+    // Render elements directly: a nested component type would remount media on every state change.
+    const renderPreviewContent = () => {
         if (!file) return null;
 
         if (file.type === "image") {
@@ -626,7 +627,7 @@ export const PreviewModal = ({ file, onClose, onToggleFavorite, files = [], onNa
                                 {t('files.ui.preview.swipeHint', { current: currentImageIndex + 1, total: imageFiles.length })}
                             </div>
                         )}
-                        <PreviewContent />
+                        {renderPreviewContent()}
                     </div>
 
                     {/* 移动端菜单 */}

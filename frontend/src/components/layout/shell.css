@@ -56,8 +56,8 @@
   min-height: 0;
   overflow: hidden;
 }
-.tv-shell :is(button, a, select):focus-visible,
-.tv-login-page :is(button, a, select):focus-visible {
+.tv-shell :is(button, a):focus-visible,
+.tv-login-page :is(button, a):focus-visible {
   outline: 3px solid hsl(var(--ring));
   outline-offset: 3px;
 }
@@ -330,7 +330,6 @@
   transition: border-color .16s ease, outline-color .16s ease;
 }
 .tv-login-field input::placeholder { color: hsl(var(--muted-foreground)); opacity: 1; font-size: var(--tv-text-body); }
-.tv-login-field input:focus { outline: 3px solid hsl(var(--primary) / .2); outline-offset: 0; border-color: hsl(var(--primary)); }
 .tv-login-field input:disabled { opacity: .6; cursor: not-allowed; }
 .tv-login-input-wrap { position: relative; }
 .tv-login-input-wrap input { padding-right: 50px; }

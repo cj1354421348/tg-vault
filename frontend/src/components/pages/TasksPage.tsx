@@ -31,6 +31,7 @@ const STATUS_OPTIONS = [
     { value: '', labelKey: 'tasks.statuses.all' }, { value: 'pending', labelKey: 'tasks.statuses.pending' },
     { value: 'running', labelKey: 'tasks.statuses.running' }, { value: 'paused', labelKey: 'tasks.statuses.paused' },
     { value: 'waiting', labelKey: 'tasks.statuses.waiting' }, { value: 'failed', labelKey: 'tasks.statuses.failed' },
+    { value: 'pausing', labelKey: 'tasks.statuses.pausing' },
     { value: 'interrupted', labelKey: 'tasks.statuses.interrupted' }, { value: 'retry_required', labelKey: 'tasks.statuses.retryRequired' },
     { value: 'completed', labelKey: 'tasks.statuses.completed' }, { value: 'cancelled', labelKey: 'tasks.statuses.cancelled' },
     { value: 'scheduled', labelKey: 'tasks.statuses.scheduled' }, { value: 'disabled', labelKey: 'tasks.statuses.disabled' },
@@ -43,6 +44,7 @@ const STAGE_LABELS: Record<string, string> = {
     resumable: 'tasks.stages.resumable', waiting_for_next_scan: 'tasks.stages.waitingForNextScan', waiting_for_next_task: 'tasks.stages.waitingForNextTask', completed: 'tasks.stages.completed',
     failed: 'tasks.stages.failed', cancelled: 'tasks.statuses.cancelled', interrupted: 'tasks.stages.interrupted',
     retry_required: 'tasks.stages.retryRequired', disabled: 'tasks.statuses.disabled',
+    paused: 'tasks.statuses.paused', pausing: 'tasks.statuses.pausing',
 };
 
 function taskKey(task: Pick<UnifiedTask, 'sourceType' | 'id'>): string { return `${task.sourceType}:${task.id}`; }
@@ -135,7 +137,7 @@ export const TasksPage = ({ onUnauthorized, onOpenUploads, onShowAllTasks, initi
         let first = true;
         const nextDelayMs = () => {
             if (document.visibilityState !== 'visible') return 60_000;
-            return tasksRef.current.some(task => ['pending', 'running', 'paused', 'waiting', 'interrupted'].includes(task.status)) ? 3_000 : 20_000;
+            return tasksRef.current.some(task => ['pending', 'running', 'pausing', 'paused', 'waiting', 'interrupted'].includes(task.status)) ? 3_000 : 20_000;
         };
         const poller = createSerialPoller({
             run: async () => {
@@ -173,6 +175,16 @@ export const TasksPage = ({ onUnauthorized, onOpenUploads, onShowAllTasks, initi
     const requestAction = (task: UnifiedTask, action: 'cancel' | 'retry') => {
         if (task.sourceType === 'web_upload' && action === 'retry') { onOpenUploads?.(); return; }
         setPendingAction({ task, action });
+    };
+    const controlChannel = async (task: UnifiedTask, action: 'pause' | 'resume') => {
+        setActing(true);
+        try {
+            await fileApi.controlTask(task.sourceType, task.id, action);
+            await loadTasks(true);
+        } catch (actionError) {
+            if (isUnauthorizedError(actionError)) onUnauthorized?.();
+            else setError(errorMessage(actionError, t('tasks.errors.action')));
+        } finally { setActing(false); }
     };
     const confirmAction = async () => {
         if (!pendingAction) return;
@@ -284,29 +296,44 @@ export const TasksPage = ({ onUnauthorized, onOpenUploads, onShowAllTasks, initi
                                 const transfer = taskTransferDisplay(task);
                                 const detailSpeed = transfer.speed;
                                 const detailEta = task.status === 'running' && typeof task.detail.eta === 'string' ? task.detail.eta : null;
+                                const scan = task.sourceType === 'telegram_channel' && ['date_range', 'tag_download'].includes(task.kind) && task.detail.scan && typeof task.detail.scan === 'object'
+                                    ? task.detail.scan as Record<string, unknown> : null;
+                                const commentMessagesScanned = Number(scan?.commentMessagesScanned ?? 0);
+                                const commentMediaFound = Number(scan?.commentMediaFound ?? 0);
+                                const lastMessageDate = typeof scan?.lastMessageDate === 'string' ? scan.lastMessageDate : null;
                                 const checked = selected.includes(taskKey(task));
                                 return <TaskRow key={taskKey(task)} data-status={task.status} aria-label={mobile ? task.title : undefined} className={cn(mobile && "audit-task-card", checked && 'is-selected')}>
                                     {selectionMode && <TaskCell className="op-select-cell"><input type="checkbox" checked={checked} disabled={!task.dismissible || acting} onChange={() => toggleSelection(task)} aria-label={t(checked ? 'tasks.selection.deselectAria' : 'tasks.selection.selectAria')} title={!task.dismissible ? t('tasks.runningNotDismissible') : undefined} /></TaskCell>}
                                     <TaskCell className="op-task-identity">
                                         <span className="op-cell-meta">{SOURCE_LABELS[task.sourceType] ? t(SOURCE_LABELS[task.sourceType]) : task.sourceType}</span>
                                         <h3 title={task.title}>{task.title}</h3>
-                                        <details className="op-task-details"><summary>{audit.details}</summary><span className="op-task-id" title={task.id}><code>{task.id}</code><button type="button" className="op-icon-button" title={t('tasks.actions.copyId')} aria-label={t('tasks.actions.copyId')} onClick={() => void navigator.clipboard.writeText(task.id)}><Copy className="h-3.5 w-3.5" /></button></span></details>
+                                        {!mobile && <details className="op-task-details"><summary>{audit.details}</summary><span className="op-task-id" title={task.id}><code>{task.id}</code><button type="button" className="op-icon-button" title={t('tasks.actions.copyId')} aria-label={t('tasks.actions.copyId')} onClick={() => void navigator.clipboard.writeText(task.id)}><Copy className="h-3.5 w-3.5" /></button></span></details>}
                                     </TaskCell>
                                     <TaskCell className="audit-task-status"><span className={cn('op-badge', statusTone(task.status))}><StatusIcon status={task.status} runningLabel={t('tasks.loading.running')} />{statusLabel}</span>{showStage && <small className="op-cell-meta">{stageLabel}</small>}</TaskCell>
                                     <TaskCell className="op-task-target" title={taskTarget(task)}>{t('tasks.target.label', { target: taskTarget(task) })}</TaskCell>
                                     <TaskCell className="op-task-transfer">
                                         {(progress > 0 || stopped || ['running', 'paused'].includes(task.status)) && <div className={cn('audit-task-progress', (stopped || task.status === 'paused') && 'is-historical')}><span className="audit-progress-label">{progressLabel}</span><div className="op-progress-line"><div className="op-progress" role="progressbar" aria-label={`${task.title}: ${progressLabel}`} aria-valuetext={`${progressLabel}: ${Math.round(progress)}%`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}><span style={{ width: `${progress}%` }} /></div><span>{Math.round(progress)}%</span></div></div>}
-                                        {task.counts.total > 0 && <small className="op-cell-meta">{t('tasks.progress.items', { completed: task.counts.completed, total: task.counts.total })}{task.counts.failed > 0 ? t('tasks.progress.failed', { count: task.counts.failed }) : ''}</small>}
-                                        {transfer.showBytes && <small className="op-cell-meta">{t('tasks.progress.data', { transferred: transfer.transferred, total: transfer.total })}</small>}
+                                        {task.counts.total > 0 && <small className="op-cell-meta">{task.sourceType === 'telegram_channel'
+                                            ? t('tasks.progress.channelItems', { processed: task.detail.processed ?? task.counts.completed, total: task.counts.total, completed: task.counts.completed, failed: task.counts.failed, skipped: task.detail.skipped ?? 0 })
+                                            : <>{t('tasks.progress.items', { completed: task.counts.completed, total: task.counts.total })}{task.counts.failed > 0 ? t('tasks.progress.failed', { count: task.counts.failed }) : ''}</>}</small>}
+                                        {task.sourceType === 'telegram_channel' && task.status !== 'completed' && !stopped && <small className="op-cell-meta">{t('tasks.progress.channelQueue', { active: task.detail.active ?? 0, pending: task.detail.pending ?? 0 })}</small>}
+                                        {scan && <small className="op-cell-meta">{t('tasks.progress.channelScan', { messages: Number(scan.channelMessagesScanned ?? 0), files: Number(scan.channelMediaFound ?? 0) })}</small>}
+                                        {scan && (commentMessagesScanned > 0 || commentMediaFound > 0) && <small className="op-cell-meta">{t('tasks.progress.commentScan', { messages: commentMessagesScanned, files: commentMediaFound })}</small>}
+                                        {lastMessageDate && <small className="op-cell-meta">{t('tasks.progress.scanDate', { time: formatDateTime(lastMessageDate, locale) })}</small>}
+                                        {task.sourceType === 'telegram_channel' && task.detail.scanStatus !== 'done' && !stopped && <small className="op-cell-meta">{t('tasks.progress.scanningHint')}</small>}
+                                        {transfer.showBytes && <small className="op-cell-meta">{t(task.sourceType === 'telegram_channel' ? 'tasks.progress.savedData' : 'tasks.progress.data', { transferred: transfer.transferred, total: transfer.total })}</small>}
+                                        {Number(task.detail.savedUnknownCount) > 0 && <small className="op-cell-meta">{t('tasks.progress.unknownSizes', { count: Number(task.detail.savedUnknownCount) })}</small>}
                                         {(detailSpeed || detailEta) && <small className="op-cell-meta">{detailSpeed ? t('tasks.progress.speed', { speed: detailSpeed }) : ''}{detailSpeed && detailEta ? ' · ' : ''}{detailEta ? t('tasks.progress.eta', { eta: detailEta }) : ''}</small>}
                                         {task.error && <p className="op-inline-error">{localizeTaskReason(task.error, t)}</p>}
                                     </TaskCell>
                                     <TaskCell className="op-task-date"><time dateTime={task.updatedAt}>{t('tasks.updated', { time: formatDateTime(task.updatedAt, locale) })}</time></TaskCell>
                                     <TaskCell className="op-task-actions">{!selectionMode && <div className="op-actions">
+                                        {['telegram_channel', 'telegram_bot'].includes(task.sourceType) && ['running', 'pending', 'waiting', 'pausing', 'paused'].includes(task.status) && <Button size="sm" variant="outline" disabled={acting} className="op-action" onClick={() => void controlChannel(task, ['paused', 'pausing'].includes(task.status) ? 'resume' : 'pause')}>{t(['paused', 'pausing'].includes(task.status) ? 'tasks.actions.continue' : 'tasks.actions.pause')}</Button>}
                                         {task.retryable && <Button size="sm" variant="outline" disabled={acting} className="op-action" onClick={() => requestAction(task, 'retry')}>{task.sourceType === 'web_upload' ? <UploadCloud className="h-4 w-4" /> : <RotateCcw className="h-4 w-4" />}{taskActionLabel(task, 'retry')}</Button>}
                                         {task.cancellable && <Button size="sm" variant="outline" disabled={acting} className="op-action op-danger-button" onClick={() => requestAction(task, 'cancel')}><Ban className="h-4 w-4" />{taskActionLabel(task, 'cancel')}</Button>}
                                         {task.dismissible && <Button size="sm" variant="ghost" disabled={acting} className="op-action op-danger-button" onClick={() => void prepareDismissal({ tasks: [task] })}><Trash2 className="h-4 w-4" />{t('tasks.actions.deleteRecord')}</Button>}
                                     </div>}</TaskCell>
+                                    {mobile && <TaskCell className="op-task-details-mobile"><details className="op-task-details"><summary>{audit.details}</summary><span className="op-task-id"><code>{task.id}</code><button type="button" className="op-icon-button" title={t('tasks.actions.copyId')} aria-label={t('tasks.actions.copyId')} onClick={() => void navigator.clipboard.writeText(task.id)}><Copy className="h-3.5 w-3.5" /></button></span></details></TaskCell>}
                                 </TaskRow>;
                             })}</TaskBody>
                         </TaskCollection>

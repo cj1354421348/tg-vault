@@ -479,6 +479,17 @@ CREATE TABLE IF NOT EXISTS telegram_notification_digest (
 ALTER TABLE telegram_notification_digest ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_telegram_notification_digest_pending ON telegram_notification_digest(user_id, chat_id, created_at) WHERE delivered_at IS NULL;
 
+-- 完成卡持久回执：保留授权、任务映射及失败明细。
+CREATE TABLE IF NOT EXISTS telegram_task_receipts (
+    id TEXT PRIMARY KEY,
+    chat_id TEXT NOT NULL,
+    user_id BIGINT NOT NULL,
+    job_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    group_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    failures JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Telegram 后台任务表（用于重启后可见、可追踪）
 CREATE TABLE IF NOT EXISTS telegram_background_jobs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -486,7 +497,7 @@ CREATE TABLE IF NOT EXISTS telegram_background_jobs (
     chat_id BIGINT,
     kind VARCHAR(50) NOT NULL,
     source TEXT NOT NULL,
-    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    status TEXT NOT NULL DEFAULT 'pending',
     scan_status TEXT DEFAULT 'pending',
     download_status TEXT DEFAULT 'pending',
     scan_cursor JSONB DEFAULT '{}'::jsonb,

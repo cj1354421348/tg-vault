@@ -44,9 +44,12 @@ Save files from Telegram private chats, channels or groups, then browse and mana
 
 ## ✨ Features
 
-- **File management**: Upload, preview and organize folders; manage archives right in the browser.
+- **File management**: Upload, preview and organize files; all folders remain visible without expanding the list. Storage accounts show safe configuration summaries and support renaming.
+- **Media previews**: Opening or closing file details preserves audio/video playback and the current position.
 - **Telegram transfer**: Send files to the Bot, or batch-save media from channels and groups.
 - **Subscription sync**: Subscribe to channels and automatically save future updates.
+- **Task controls**: Pause, resume, cancel and retry downloads from the Web or Bot; both show live item counts, download speed, save destinations and scan progress.
+- **Account scheduling**: Downloads use eligible Telegram accounts with shared cooldowns; channel scans are serialized per account and paced to reduce FloodWait errors.
 - **Multiple storage backends**: Local disk, OneDrive, Google Drive, OSS, S3 and WebDAV.
 - **Automatic archiving**: Organize files by source, channel and file type.
 - **Access protection**: Admin login, Bot user permissions and two-factor authentication.
@@ -90,7 +93,6 @@ After connecting the Bot, send `/start` to begin and `/help` to view the help me
 
 | Command | Purpose |
 | --- | --- |
-| `/list` | View recent files |
 | `/tasks` | View and manage tasks |
 | `/storage` | View storage status |
 | `/path_rules` | Set the save location |
@@ -99,6 +101,12 @@ After connecting the Bot, send `/start` to begin and `/help` to view the help me
 | `/tg_subs` | View subscriptions |
 
 Channel downloads and subscriptions require logging in with a Telegram account that has access to them.
+
+Date/tag downloads now show scan progress in Bot cards, task details, and the Web task center: messages checked, files discovered, comment counts, and the timestamp reached by the scan. Checked messages include non-matching and non-downloadable messages; album files are counted uniquely. No extra Telegram requests are made to estimate scan totals, and no scan percentage is shown when the total is unknown.
+
+The download wizard lets you edit the source, date range or tag, save directory and comment options before confirming. Failed submissions retain the draft; one-time storage targets are consumed only after a task is created. Completed cards retain failure details and retry links after a restart. Bot `/list` and `/find` are no longer available; use the Web file manager to browse and search files.
+
+Backend startup automatically applies migration `2026101201_telegram_background_job_status_text`, fixing finalization of tasks with partial failures and adding persistent task receipts. No manual database changes are needed.
 
 <details>
 <summary>More commands</summary>
@@ -121,6 +129,8 @@ Go to your TG Vault project directory and run the one-click upgrade script:
 ```bash
 ./deploy/install.sh
 ```
+
+The container build and backend runtime now use Node.js 24 LTS. The installer rebuilds the application containers while retaining configuration, database and file volumes; the host Node.js installation does not need to change.
 
 ---
 

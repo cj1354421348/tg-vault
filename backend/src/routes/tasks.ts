@@ -6,10 +6,11 @@ import { requireAuth, getAuthToken } from './auth.js';
 import { webDestructiveConfirmationStore } from '../services/webDestructiveConfirmation.js';
 import { listTransferTasks, getTransferTask, updateTransferTask } from '../services/transferTasks.js';
 
-import { getDownloadTaskGroup, cancelDownloadTaskGroup, retryFailedDownloadTasks, cancelChannelExecutionGroup } from '../services/telegramUpload.js';
-import { cancelTelegramBackgroundJob, retryTelegramBackgroundJob } from '../services/telegramChannelJobs.js';
+import { getDownloadTaskSnapshot, getDownloadTaskGroup, cancelDownloadTaskGroup, retryFailedDownloadTasks, getChannelExecutionGroup, pauseDownloadTaskGroup, resumeDownloadTaskGroup } from '../services/telegramUpload.js';
+import { cancelTelegramBackgroundJob, retryTelegramBackgroundJob, pauseTelegramBackgroundJob, resumeTelegramBackgroundJob } from '../services/telegramChannelJobs.js';
 import { filterDismissedTasks, isTaskDismissible, loadTaskCenterDismissals, saveTaskCenterDismissals } from '../services/taskCenterDismissals.js';
 import { mapTelegramChannelJob, mapTransferTask } from '../services/unifiedTaskMapper.js';
+import { channelRuntimeView } from '../services/telegramChannelRuntimeView.js';
 import crypto from 'node:crypto';
 
 const router = Router();
@@ -25,8 +26,13 @@ async function collectUnifiedTasks(limit: number, accountId?: string): Promise<a
                         COUNT(i.id) FILTER (WHERE i.status = 'success')::int AS completed_items,
                         COUNT(i.id) FILTER (WHERE i.status = 'failed')::int AS failed_items,
                         COUNT(i.id) FILTER (WHERE i.status = 'skipped')::int AS skipped_count_items,
-                        COUNT(i.id) FILTER (WHERE i.status IN ('pending','downloading'))::int AS active_items,
-                        COALESCE(SUM(i.total_size), 0)::text AS total_bytes
+                        COUNT(i.id) FILTER (WHERE i.status = 'pending')::int AS pending_count,
+                        COUNT(i.id) FILTER (WHERE i.status = 'downloading')::int AS downloading_count,
+                        COALESCE(SUM(i.total_size) FILTER (WHERE i.status = 'success'), 0)::text AS completed_bytes,
+                        COALESCE(SUM(i.total_size), 0)::text AS total_bytes,
+                        COUNT(i.id) FILTER (WHERE COALESCE(i.total_size, 0) <= 0)::int AS unknown_size_count,
+                        COUNT(i.id) FILTER (WHERE i.status = 'success' AND COALESCE(i.total_size, 0) <= 0)::int AS completed_unknown_size_count,
+                        GREATEST(j.updated_at, MAX(i.updated_at)) AS progress_updated_at
                  FROM telegram_background_jobs j
                  LEFT JOIN telegram_download_items i ON i.job_id = j.id
                  WHERE ($2::uuid IS NULL OR (j.params->>'storageAccountId') = $2::text)
@@ -58,8 +64,8 @@ async function collectUnifiedTasks(limit: number, accountId?: string): Promise<a
             query('SELECT id, name FROM storage_accounts'),
         ]);
         const accountNames = new Map(accounts.rows.map(row => [String(row.id), String(row.name)]));
-        const tasks: any[] = transfers.map(task => mapTransferTask(task, accountNames, task.sourceType === 'telegram_bot' ? getDownloadTaskGroup(task.id) || undefined : undefined));
-        for (const row of channels.rows) tasks.push(mapTelegramChannelJob(row, accountNames));
+        const tasks = transfers.map(task => mapTransferTask(task, accountNames, task.sourceType === 'telegram_bot' ? getDownloadTaskSnapshot(task.id) : undefined));
+        for (const row of channels.rows) tasks.push(mapTelegramChannelJob(channelRuntimeView(row, getChannelExecutionGroup(String(row.id))), accountNames));
         for (const row of chunks.rows) {
             const total = Number(row.total_size || 0);
             const received = Number(row.received_bytes || 0);
@@ -267,7 +273,8 @@ router.post('/:sourceType/:id/:action', requireAuth, async (req: Request, res: R
     const sourceType = String(req.params.sourceType);
     const id = String(req.params.id);
     const action = String(req.params.action);
-    if (!['cancel', 'retry'].includes(action)) return res.status(400).json({ error: '不支持的任务操作' });
+    if (!['cancel', 'retry', 'pause', 'resume'].includes(action)) return res.status(400).json({ error: '不支持的任务操作' });
+    if (['pause', 'resume'].includes(action) && !['telegram_channel', 'telegram_bot'].includes(sourceType)) return res.status(400).json({ error: '该任务类型不支持暂停或继续' });
     if (action === 'cancel') {
         const authToken = getAuthToken(req);
         const confirmationToken = String(req.header('x-confirmation-token') || '');
@@ -287,6 +294,12 @@ router.post('/:sourceType/:id/:action', requireAuth, async (req: Request, res: R
         if (sourceType === 'telegram_bot') {
             const task = await getTransferTask('telegram_bot', id);
             if (!task) return res.status(404).json({ error: '任务不存在' });
+            if (action === 'pause' || action === 'resume') {
+                if (!task.chatId || task.ownerUserId == null) return res.status(409).json({ error: '任务缺少控制作用域' });
+                const control = action === 'pause' ? pauseDownloadTaskGroup : resumeDownloadTaskGroup;
+                const result = control(id, task.chatId, task.ownerUserId);
+                return res.status(result.status === 'ok' ? 200 : 409).json({ success: result.status === 'ok', error: result.status === 'ok' ? undefined : '任务状态已变化，请刷新后重试' });
+            }
             if (action === 'cancel') {
                 if (['failed', 'interrupted', 'retry_required'].includes(task.status) || task.retryable) {
                     await updateTransferTask('telegram_bot', id, {
@@ -317,9 +330,13 @@ router.post('/:sourceType/:id/:action', requireAuth, async (req: Request, res: R
         if (sourceType === 'telegram_channel') {
             const row = (await query('SELECT user_id, chat_id FROM telegram_background_jobs WHERE id = $1', [id])).rows[0];
             if (!row) return res.status(404).json({ error: '任务不存在' });
+            if (action === 'pause' || action === 'resume') {
+                const control = action === 'pause' ? pauseTelegramBackgroundJob : resumeTelegramBackgroundJob;
+                const task = await control(Number(row.user_id), id, row.chat_id == null ? undefined : String(row.chat_id));
+                return res.status(task ? 200 : 409).json({ success: Boolean(task), error: task ? undefined : '任务状态已变化，请刷新后重试' });
+            }
             if (action === 'cancel') {
                 const task = await cancelTelegramBackgroundJob(Number(row.user_id), id, row.chat_id == null ? undefined : String(row.chat_id));
-                if (task) cancelChannelExecutionGroup(id);
                 return res.status(task ? 200 : 409).json({ success: Boolean(task), error: task ? undefined : '任务当前不能取消' });
             }
             const task = await retryTelegramBackgroundJob(Number(row.user_id), id, row.chat_id == null ? undefined : String(row.chat_id));

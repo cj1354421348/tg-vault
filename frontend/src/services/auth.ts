@@ -1,5 +1,6 @@
 import { API_BASE } from './config';
 import { tr } from '../i18n/runtime';
+import { invalidateSettingsRequests } from './settingsRequestCache';
 
 export interface AuthStatus {
     setupRequired: boolean;
@@ -34,6 +35,7 @@ class AuthService {
     }
 
     clearToken() {
+        invalidateSettingsRequests();
         localStorage.removeItem('tg_vault_token');
         localStorage.removeItem('tg_vault_token_expiry');
     }

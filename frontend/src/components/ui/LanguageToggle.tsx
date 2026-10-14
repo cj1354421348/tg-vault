@@ -11,7 +11,7 @@ export const LanguageToggle = ({ compact = false, className }: { compact?: boole
       <Languages className="h-4 w-4 shrink-0" aria-hidden="true" />
       <span className="sr-only">{t('common.language.label')}</span>
       <select
-        className={cn('min-w-0 !border-0 !bg-transparent !shadow-none py-2 text-sm font-medium text-foreground outline-none', compact && 'max-w-28')}
+        className={cn('min-w-0 py-2 text-sm font-medium text-foreground', compact && 'max-w-28')}
         aria-label={t('common.language.select')}
         value={current}
         onChange={event => void i18n.changeLanguage(event.target.value as AppLocale)}

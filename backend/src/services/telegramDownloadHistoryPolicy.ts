@@ -25,6 +25,11 @@ export async function compactTelegramDownloadHistory(jobId?: string): Promise<nu
     const policy = await getTelegramDownloadHistoryPolicy();
     const statuses = terminalStatusesToDelete(policy);
     if (statuses.length === 0) return 0;
+    await query(`UPDATE telegram_background_jobs j SET params = j.params || jsonb_build_object(
+        'completedBytes', COALESCE((SELECT SUM(total_size) FROM telegram_download_items WHERE job_id=j.id AND status='success'),0),
+        'savedUnknownCount', (SELECT COUNT(*) FROM telegram_download_items WHERE job_id=j.id AND status='success' AND COALESCE(total_size,0)<=0))
+        WHERE j.finished_at IS NOT NULL AND ($1::uuid IS NULL OR j.id=$1::uuid)
+          AND EXISTS (SELECT 1 FROM telegram_download_items WHERE job_id=j.id AND status='success')`, [jobId || null]);
     const result = await query(
         `DELETE FROM telegram_download_items i
          USING telegram_background_jobs j

@@ -6,6 +6,7 @@ import { CheckCircle2, Clock3, KeyRound, LoaderCircle, Plus, Power, PowerOff, Re
 import { QRCodeSVG } from 'qrcode.react';
 import { fileApi, type TelegramPermissionSummary, type TelegramUserAccount, type TelegramUserAccountsOverview, type TelegramUserLoginStatus } from '../../services/api';
 import { errorMessage } from '../../services/unknownError';
+import { invalidateSettingsRequests } from '../../services/settingsRequestCache';
 import { cn } from '../../lib/utils';
 import { Button } from '../ui/Button';
 import { Dialog } from '../ui/Dialog';
@@ -30,10 +31,21 @@ function blankOverview(): TelegramUserAccountsOverview {
     };
 }
 
-function statusView(account: TelegramUserAccount, t: TFunction): { label: string; className: string } {
+function isLongRateLimit(account: TelegramUserAccount, now: number): boolean {
+    return account.enabled && account.health === 'cooldown'
+        && account.scheduling.activeDownloads === 0
+        && Date.parse(account.cooldownUntil || '') - now > 5 * 60_000;
+}
+
+function statusView(account: TelegramUserAccount, t: TFunction, now: number): { label: string; className: string } {
     if (!account.enabled || account.health === 'disabled') return { label: t('management.telegramAccounts.status.disabled'), className: 'settings-status--muted' };
     if (account.health === 'ready' && account.connected) return { label: t('management.telegramAccounts.status.ready'), className: 'settings-status--success' };
-    if (account.health === 'cooldown') return { label: t('management.telegramAccounts.status.cooldown'), className: 'settings-status--warning' };
+    if (account.health === 'cooldown') {
+        if (isLongRateLimit(account, now)) return { label: t('management.telegramAccounts.status.cooldown'), className: 'settings-status--warning' };
+        return account.connected
+            ? { label: t('management.telegramAccounts.status.ready'), className: 'settings-status--success' }
+            : { label: t('management.telegramAccounts.status.connecting'), className: 'settings-status--info' };
+    }
     if (account.health === 'permission_denied') return { label: t('management.telegramAccounts.status.permissionDenied'), className: 'settings-status--warning' };
     if (account.health === 'connecting') return { label: t('management.telegramAccounts.status.connecting'), className: 'settings-status--info' };
     return { label: account.health === 'expired' ? t('management.telegramAccounts.status.expired') : t('management.telegramAccounts.status.error'), className: 'settings-status--danger' };
@@ -340,7 +352,8 @@ export function TelegramUserAccountsPanel({
     const [busyAccountId, setBusyAccountId] = useState<string | null>(null);
     const [loginOpen, setLoginOpen] = useState(false);
 
-    const reload = useCallback(async () => {
+    const reload = useCallback(async (fresh = false) => {
+        if (fresh) invalidateSettingsRequests();
         setLoadError(null);
         try {
             setOverview(await fileApi.getTelegramUserAccounts());
@@ -349,7 +362,16 @@ export function TelegramUserAccountsPanel({
         } finally { setLoading(false); }
     }, [t]);
 
-    useEffect(() => { void reload(); }, [reload]);
+    useEffect(() => {
+        let stopped = false;
+        let timer: number | undefined;
+        const poll = async () => {
+            if (document.visibilityState === 'visible') await reload(true);
+            if (!stopped) timer = window.setTimeout(poll, 5000);
+        };
+        void poll();
+        return () => { stopped = true; window.clearTimeout(timer); };
+    }, [reload]);
 
     const mutateAccount = async (account: TelegramUserAccount, operation: 'enable' | 'disable' | 'unlink') => {
         if (busyAccountId) return;
@@ -366,7 +388,7 @@ export function TelegramUserAccountsPanel({
             if (operation === 'enable') await fileApi.setTelegramUserAccountEnabled(account.id, true);
             if (operation === 'disable') await fileApi.setTelegramUserAccountEnabled(account.id, false);
             if (operation === 'unlink') await fileApi.unlinkTelegramUserAccountById(account.id);
-            await reload();
+            await reload(true);
             if (operation === 'enable') await onNotice(t('management.telegramAccounts.notices.enabled'));
             if (operation === 'disable') await onNotice(t('management.telegramAccounts.notices.disabled'));
             if (operation === 'unlink') await onNotice(t('management.telegramAccounts.notices.unlinked'));
@@ -374,6 +396,15 @@ export function TelegramUserAccountsPanel({
             await onNotice(errorMessage(error) || t('management.telegramAccounts.errors.operation'), t('management.telegramAccounts.errors.operationTitle'));
         } finally { setBusyAccountId(null); }
     };
+
+    const [now, setNow] = useState(Date.now);
+    useEffect(() => {
+        const timer = window.setInterval(() => setNow(Date.now()), 15_000);
+        return () => window.clearInterval(timer);
+    }, []);
+    const limitedCount = overview.accounts.filter(account => isLongRateLimit(account, now)).length;
+    const readyCount = overview.accounts.filter(account => account.enabled && account.connected
+        && (account.health === 'ready' || (account.health === 'cooldown' && !isLongRateLimit(account, now)))).length;
 
     return (
         <div className="settings-surface settings-telegram">
@@ -389,12 +420,12 @@ export function TelegramUserAccountsPanel({
             </div>
 
             {!configured && <div className="settings-notice settings-status--warning"><ShieldAlert className="mr-2 inline h-4 w-4" />{t('management.telegramAccounts.botRequired')}</div>}
-            {loadError && <div role="alert" className="settings-notice settings-status--danger settings-action-row"><span>{loadError}</span><Button variant="outline" size="sm" onClick={() => void reload()}>{t('management.telegramAccounts.retry')}</Button></div>}
+            {loadError && <div role="alert" className="settings-notice settings-status--danger settings-action-row"><span>{loadError}</span><Button variant="outline" size="sm" onClick={() => void reload(true)}>{t('management.telegramAccounts.retry')}</Button></div>}
 
             <div className="settings-metrics">
                 <SettingsMetric label={t('management.telegramAccounts.summary.enabled')}>{overview.summary.enabled}<span className="settings-metric__denominator">/ {overview.summary.total}</span></SettingsMetric>
-                <SettingsMetric label={t('management.telegramAccounts.summary.ready')} tone="success">{overview.summary.ready}</SettingsMetric>
-                <SettingsMetric label={t('management.telegramAccounts.summary.cooldown')} tone="warning">{overview.summary.coolingDown}</SettingsMetric>
+                <SettingsMetric label={t('management.telegramAccounts.summary.ready')} tone="success">{readyCount}</SettingsMetric>
+                {limitedCount > 0 && <SettingsMetric label={t('management.telegramAccounts.summary.cooldown')} tone="warning">{limitedCount}</SettingsMetric>}
                 <SettingsMetric label={t('management.telegramAccounts.summary.permissions')}><PermissionSummary summary={overview.summary.permissions} compact /></SettingsMetric>
             </div>
 
@@ -406,8 +437,9 @@ export function TelegramUserAccountsPanel({
 
             {loading ? <div className="flex min-h-32 items-center justify-center text-[13px] text-muted-foreground"><LoaderCircle className="mr-2 h-5 w-5 animate-spin" />{t('management.telegramAccounts.loading')}</div> : !loadError && overview.accounts.length === 0 ? <div className="settings-empty"><UserRound className="mx-auto h-8 w-8 text-muted-foreground/60" /><p className="mt-3 text-[13px] font-medium">{t('management.telegramAccounts.empty.title')}</p><p className="mt-1 text-[12px] text-muted-foreground">{t('management.telegramAccounts.empty.description')}</p></div> : <div className="space-y-3">
                 {overview.accounts.map(account => {
-                    const status = statusView(account, t);
+                    const status = statusView(account, t, now);
                     const busy = busyAccountId === account.id;
+                    const rateLimited = /FLOOD|Too many requests/i.test(account.lastError || '');
                     return <article key={account.id} className="settings-telegram-account">
                         <div className="settings-telegram-account__layout">
                             <div className="min-w-0 flex-1">
@@ -421,8 +453,11 @@ export function TelegramUserAccountsPanel({
                                     <p><Clock3 className="mr-1 inline h-3.5 w-3.5" />{t('management.telegramAccounts.account.lastChecked')}: {formatTime(account.checkedAt, locale) || t('management.telegramAccounts.permissions.notChecked')}</p>
                                     <p>{t('management.telegramAccounts.account.weight', { value: account.scheduling.weight })}</p>
                                 </div>
-                                {account.cooldownUntil && <p className="mt-2 text-[12px] settings-text-warning">{t('management.telegramAccounts.account.cooldownUntil', { time: formatTime(account.cooldownUntil, locale) || t('management.telegramAccounts.account.pendingUpdate') })}</p>}
-                                {account.lastError && account.health !== 'disabled' && <p className="mt-2 break-words text-[12px] settings-text-danger">{t('management.telegramAccounts.account.lastError')}: {account.lastError}</p>}
+                                {isLongRateLimit(account, now) && <div className="mt-2 text-[12px] leading-5 text-muted-foreground">
+                                    <p>{t('management.telegramAccounts.account.rateLimitHint')}</p>
+                                    {account.cooldownUntil && <p>{t('management.telegramAccounts.account.cooldownUntil', { time: formatTime(account.cooldownUntil, locale) || t('management.telegramAccounts.account.pendingUpdate') })}</p>}
+                                </div>}
+                                {account.lastError && account.health !== 'disabled' && (!rateLimited || account.health === 'error' || account.health === 'expired') && <p className="mt-2 break-words text-[12px] settings-text-danger">{t('management.telegramAccounts.account.lastError')}: {account.lastError}</p>}
                                 {!account.enabled && <p className="mt-2 text-[12px] text-muted-foreground">{t('management.telegramAccounts.account.disabledHint')}</p>}
                             </div>
                             <div className="settings-actions settings-telegram-account__actions">
@@ -435,7 +470,7 @@ export function TelegramUserAccountsPanel({
             </div>}
 
             </div>
-            <LoginDialog open={loginOpen} onClose={() => setLoginOpen(false)} onComplete={async () => { await reload(); await onNotice(t('management.telegramAccounts.notices.bound')); }} />
+            <LoginDialog open={loginOpen} onClose={() => setLoginOpen(false)} onComplete={async () => { await reload(true); await onNotice(t('management.telegramAccounts.notices.bound')); }} />
         </div>
     );
 }

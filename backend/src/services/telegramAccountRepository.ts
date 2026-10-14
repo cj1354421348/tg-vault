@@ -1,6 +1,7 @@
 import { query } from '../db/index.js';
 import { encryptCredential } from '../utils/credentialCrypto.js';
 import type { TelegramAccountHealthState, TelegramSourceAccessState } from './telegramAccountScheduler.js';
+import { normalizeTelegramAccountSourceKey } from './telegramAccountScheduler.js';
 
 export type TelegramAccountSourceScope = 'download' | 'scan' | 'metadata';
 export type TelegramDownloadAttemptStatus = 'running' | 'succeeded' | 'failed' | 'cancelled';
@@ -38,6 +39,12 @@ export interface TelegramAccountSourceAccessRecord {
     lastError: string | null;
     checkedAt: Date | null;
 }
+
+// Read legacy aliases too; the latest probe wins until all keys are rewritten.
+const canonicalSourceKeySql = `CASE
+    WHEN BTRIM(source_key) ~ '^-100[0-9]+$' THEN SUBSTRING(BTRIM(source_key) FROM 5)
+    WHEN BTRIM(source_key) ~ '^@?[A-Za-z0-9_]+$' THEN LOWER(LTRIM(BTRIM(source_key), '@'))
+    ELSE BTRIM(source_key) END`;
 
 function mapAccount(row: any): TelegramUserAccountRecord {
     return {
@@ -169,27 +176,38 @@ export class TelegramAccountRepository {
         return result.rowCount === 1;
     }
 
-    async listAccessForAccount(accountId: string): Promise<TelegramAccountSourceAccessRecord[]> {
+    async listAccessForAccounts(accountIds: readonly string[]): Promise<Map<string, {
+        permissions: TelegramAccountSourceAccessRecord[];
+        summary: { allowed: number; denied: number; unknown: number; total: number; lastCheckedAt: Date | null };
+    }>> {
+        const accessByAccount = new Map(accountIds.map(accountId => [accountId, {
+            permissions: [] as TelegramAccountSourceAccessRecord[],
+            summary: { allowed: 0, denied: 0, unknown: 0, total: 0, lastCheckedAt: null as Date | null },
+        }]));
+        if (accountIds.length === 0) return accessByAccount;
+
         const result = await this.db.query(`
             SELECT * FROM telegram_account_source_access
-            WHERE account_id = $1 ORDER BY checked_at DESC NULLS LAST, source_key, scope
-        `, [accountId]);
-        return result.rows.map(mapAccess);
-    }
-
-    async getAccessSummaryForAccount(accountId: string): Promise<{ allowed: number; denied: number; unknown: number; total: number; lastCheckedAt: Date | null }> {
-        const result = await this.db.query(`
-            SELECT COUNT(*)::int AS total,
-                   COUNT(*) FILTER (WHERE access_state = 'allowed')::int AS allowed,
-                   COUNT(*) FILTER (WHERE access_state = 'denied')::int AS denied,
-                   COUNT(*) FILTER (WHERE access_state = 'unknown')::int AS unknown,
-                   MAX(checked_at) AS last_checked_at
-            FROM telegram_account_source_access
-            WHERE account_id = $1 AND scope = 'download'
-        `, [accountId]);
-        const row = result.rows[0] || {};
-        const total = Number(row.total || 0);
-        return { allowed: Number(row.allowed || 0), denied: Number(row.denied || 0), unknown: Number(row.unknown || 0), total, lastCheckedAt: row.last_checked_at || null };
+            WHERE account_id = ANY($1::uuid[])
+            ORDER BY account_id, checked_at DESC NULLS LAST, source_key, scope
+        `, [accountIds]);
+        for (const row of result.rows) {
+            const permission = mapAccess(row);
+            const access = accessByAccount.get(permission.accountId);
+            if (!access) continue;
+            access.permissions.push(permission);
+            // Details include every scope; the existing summary counts only download probes.
+            if (permission.scope !== 'download') continue;
+            const summary = access.summary;
+            summary.total++;
+            if (permission.accessState === 'allowed') summary.allowed++;
+            else if (permission.accessState === 'denied') summary.denied++;
+            else if (permission.accessState === 'unknown') summary.unknown++;
+            if (permission.checkedAt && (!summary.lastCheckedAt || permission.checkedAt > summary.lastCheckedAt)) {
+                summary.lastCheckedAt = permission.checkedAt;
+            }
+        }
+        return accessByAccount;
     }
 
     async updateSession(accountId: string, session: string): Promise<boolean> {
@@ -251,7 +269,7 @@ export class TelegramAccountRepository {
                 access_state = EXCLUDED.access_state, last_error = EXCLUDED.last_error,
                 checked_at = NOW(), updated_at = NOW()
             RETURNING *
-        `, [accountId, sourceKey, scope, accessState, error]);
+        `, [accountId, normalizeTelegramAccountSourceKey(sourceKey), scope, accessState, error]);
         return mapAccess(result.rows[0]);
     }
 
@@ -268,16 +286,18 @@ export class TelegramAccountRepository {
     async getSourceAccess(accountId: string, sourceKey: string, scope: TelegramAccountSourceScope): Promise<TelegramAccountSourceAccessRecord | null> {
         const result = await this.db.query(`
             SELECT * FROM telegram_account_source_access
-            WHERE account_id = $1 AND source_key = $2 AND scope = $3
-        `, [accountId, sourceKey, scope]);
+            WHERE account_id = $1 AND ${canonicalSourceKeySql} = $2 AND scope = $3
+            ORDER BY checked_at DESC NULLS LAST, (source_key = $2) DESC LIMIT 1
+        `, [accountId, normalizeTelegramAccountSourceKey(sourceKey), scope]);
         return result.rows[0] ? mapAccess(result.rows[0]) : null;
     }
 
     async listSourceAccess(sourceKey: string, scope: TelegramAccountSourceScope): Promise<TelegramAccountSourceAccessRecord[]> {
         const result = await this.db.query(`
-            SELECT * FROM telegram_account_source_access
-            WHERE source_key = $1 AND scope = $2 ORDER BY checked_at DESC NULLS LAST, account_id
-        `, [sourceKey, scope]);
+            SELECT DISTINCT ON (account_id) * FROM telegram_account_source_access
+            WHERE ${canonicalSourceKeySql} = $1 AND scope = $2
+            ORDER BY account_id, checked_at DESC NULLS LAST, (source_key = $1) DESC
+        `, [normalizeTelegramAccountSourceKey(sourceKey), scope]);
         return result.rows.map(mapAccess);
     }
 

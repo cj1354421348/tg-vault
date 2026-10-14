@@ -22,8 +22,6 @@ export const BOT_COMMANDS: BotCommandDefinition[] = [
     { command: 'storage', description: '存储状态 / 删除本地实体文件', helpDescription: '查看存储状态；可确认删除本地实体文件', category: 'main', menu: true, help: true },
     { command: 'path_rules', description: '保存位置 / 自定义目录', helpDescription: '打开保存位置与自定义目录面板', category: 'main', aliases: ['path', 'save_rules'], menu: true, help: true },
     { command: 'tg_download', description: '按日期 / 标签下载频道文件', helpDescription: '打开按日期或标签下载向导', category: 'main', aliases: ['tg_dl'], menu: true, help: true },
-    { command: 'list', description: '查看最近文件', helpDescription: '查看最近文件和可复制的文件 ID', category: 'files', usage: '[数量] [页码]', menu: true, help: true },
-    { command: 'find', description: '搜索和操作文件', helpDescription: '按名称、类型、目录、日期或收藏搜索文件并打开操作卡', category: 'files', usage: '[关键词] [type:image|video|audio|document] [folder:目录] [after:YYYY-MM-DD] [before:YYYY-MM-DD] [fav]', menu: true, help: true },
     { command: 'tg_sub', description: '管理频道自动同步', helpDescription: '打开频道订阅管理向导', category: 'channels', aliases: ['tg_subscribe'], menu: true, help: true },
     { command: 'storage_switch', description: '切换系统默认存储', helpDescription: '切换所有新任务使用的系统默认存储', category: 'settings', aliases: ['switch_storage', 'storage_source'], menu: true, help: true },
     { command: 'target', description: '设置当前聊天存储目标', helpDescription: '设置下一次或当前聊天持续使用的存储账户；不修改系统默认', category: 'files', menu: true, help: true },

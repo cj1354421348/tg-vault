@@ -297,7 +297,8 @@ export async function persistOrdinaryTransferTask(group: DownloadTaskGroupSnapsh
             started_at=COALESCE(transfer_tasks.started_at, EXCLUDED.started_at), finished_at=EXCLUDED.finished_at,
             snapshot_version=EXCLUDED.snapshot_version, updated_at=NOW()
          WHERE EXCLUDED.snapshot_version > transfer_tasks.snapshot_version
-           AND transfer_tasks.status NOT IN ('completed','failed','cancelled')`,
+           AND (transfer_tasks.status NOT IN ('completed','failed','cancelled')
+                OR (transfer_tasks.status = 'cancelled' AND EXCLUDED.status = 'cancelled'))`,
         [group.id, group.kind, group.title, status,
             status === 'running' ? 'downloading' : status === 'pending' ? 'waiting' : status,
             bytes.percent,

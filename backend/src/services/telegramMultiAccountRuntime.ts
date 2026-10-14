@@ -5,12 +5,13 @@ import {
     telegramUserClientPool,
     type SelectedTelegramDownloadAccount,
     type TelegramAccountSelectionOptions,
-    isTelegramSessionExpiredError,
 } from './telegramUserClientPool.js';
 import { registerTelegramMultiAccountAuthorizedAdapter } from './telegramMultiAccountLogin.js';
 import { createTelegramMultiAccountAuthorizedAdapter } from './telegramMultiAccountLoginAdapter.js';
 import { triggerTelegramAccountAccessSweep } from './telegramAccountAccessSweep.js';
 import { installTelegramAccountAccessSweep } from './telegramAccountAccessSweepAdapter.js';
+import { normalizeTelegramAccountSourceKey } from './telegramAccountScheduler.js';
+import { waitForInitialTelegramRecovery } from './telegramInitialRecovery.js';
 
 let installed = false;
 let initializationPromise: Promise<void> | null = null;
@@ -49,13 +50,14 @@ export async function selectTelegramDownloadAccount(
     const normalized = typeof (options as Iterable<string>)?.[Symbol.iterator] === 'function'
         ? { excludeAccountIds: options as Iterable<string> }
         : options as TelegramAccountSelectionOptions;
+    await waitForInitialTelegramRecovery(normalized.signal);
     return telegramUserClientPool.select(sourceKey, { ...normalized, scope: normalized.scope || 'download' });
 }
 
 export async function markTelegramAccountCooldown(accountId: string, seconds: number, error: string | null = null): Promise<void> {
-    await telegramAccountRepository.markCooldown(accountId, seconds, error);
-    const safeSeconds = Number.isFinite(seconds) ? Math.max(1, seconds) : 60;
+    const safeSeconds = Number.isFinite(seconds) ? Math.max(1, Math.ceil(seconds)) : 60;
     telegramUserClientPool.updateCooldown(accountId, new Date(Date.now() + safeSeconds * 1000), error);
+    await telegramAccountRepository.markCooldown(accountId, safeSeconds, error);
 }
 
 export async function markTelegramAccountSourceAccess(
@@ -65,8 +67,9 @@ export async function markTelegramAccountSourceAccess(
     state: 'unknown' | 'allowed' | 'denied',
     error: string | null = null,
 ): Promise<void> {
-    await telegramAccountRepository.markSourceAccess(accountId, sourceKey, scope, state, error);
-    telegramUserClientPool.updateSourceAccess(accountId, sourceKey, scope, state);
+    const key = normalizeTelegramAccountSourceKey(sourceKey);
+    await telegramAccountRepository.markSourceAccess(accountId, key, scope, state, error);
+    telegramUserClientPool.updateSourceAccess(accountId, key, scope, state);
 }
 
 export async function markTelegramAccountSessionExpired(accountId: string, error: string | null = null): Promise<void> {
@@ -74,22 +77,22 @@ export async function markTelegramAccountSessionExpired(accountId: string, error
     await telegramUserClientPool.expireAccount(accountId);
 }
 
-export function classifyTelegramDownloadAccountError(error: unknown): 'session_expired' | 'permission_denied' | 'flood_wait' | 'retryable' {
-    const value = error as { errorMessage?: unknown; message?: unknown; seconds?: unknown; value?: unknown } | null;
-    const text = `${value?.errorMessage || ''} ${value?.message || ''}`;
-    if (isTelegramSessionExpiredError(error)) return 'session_expired';
-    if (/CHANNEL_PRIVATE|USER_NOT_PARTICIPANT|CHAT_FORBIDDEN|CHAT_ADMIN_REQUIRED|Could not find the input entity|Cannot find any entity|forbidden|privacy/i.test(text)) return 'permission_denied';
-    if (Number(value?.seconds || value?.value || text.match(/FLOOD_WAIT_?(\d+)/i)?.[1] || 0) > 0 || /FLOOD|Too many requests/i.test(text)) return 'flood_wait';
-    return 'retryable';
+/** The callback owns cancellation of in-flight RPCs; the lease remains held until it settles. */
+export async function withTelegramAccount<T>(
+    sourceKey: string,
+    scope: 'download' | 'scan' | 'metadata',
+    operation: (client: TelegramClient, accountId: string) => Promise<T>,
+    options: { signal?: AbortSignal } = {},
+): Promise<T> {
+    await waitForInitialTelegramRecovery(options.signal);
+    return telegramUserClientPool.withAccount(sourceKey, scope, operation, options);
 }
 
-export function telegramFloodWaitSeconds(error: unknown): number {
-    const value = error as { errorMessage?: unknown; message?: unknown; seconds?: unknown; value?: unknown } | null;
-    const text = `${value?.errorMessage || ''} ${value?.message || ''}`;
-    return Math.max(30, Number(value?.seconds || value?.value || text.match(/FLOOD_WAIT_?(\d+)/i)?.[1] || 60));
-}
 
 export {
+    classifyTelegramDownloadAccountError,
+    telegramFloodWaitSeconds,
+    NoEligibleTelegramAccountError,
     deleteTelegramUserAccount,
     finishTelegramDownloadAttempt,
     getTelegramAccountSourceAccess,

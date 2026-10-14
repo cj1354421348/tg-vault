@@ -1,6 +1,6 @@
 import type { DownloadTaskGroupSnapshot } from './downloadTaskQueue.js';
 import type { TransferTaskRecord } from './transferTasks.js';
-import { telegramChannelJobTaskState } from './unifiedTaskMapper.js';
+import { telegramChannelJobTaskState, telegramChannelJobCounts } from './unifiedTaskMapper.js';
 import { DEFAULT_LOCALE, TELEGRAM_LOCALES, formatDate, t, type TelegramLocale } from '../i18n/telegram.js';
 
 export type TaskCenterSourceType = 'memory' | 'channel';
@@ -35,6 +35,7 @@ export interface TaskCenterItem {
     targetFolder?: string | null;
     reason?: string;
     protection?: TaskCenterProtection;
+    scanProgressText?: string;
     createdAt: number;
     updatedAt: number;
 }
@@ -63,7 +64,7 @@ export type ParsedTaskCenterCallback =
     | { view: 'action'; action: TaskCenterAction; sourceType: TaskCenterSourceType; id: string; page: number };
 
 const PAGE_SIZE = 6;
-const VALID_ID = /^[A-Za-z0-9-]{1,24}$/;
+const VALID_ID = /^[A-Za-z0-9_-]{1,24}$/;
 const ACTION_CODES: Record<TaskCenterAction, string> = {
     start: 's',
     pause: 'p',
@@ -101,14 +102,14 @@ function kindLabel(kind: TaskCenterKind, locale: TelegramLocale): string {
     return t(locale, `taskCenter.kind.${kind}`);
 }
 
-function stateMeta(state: TaskCenterState, locale: TelegramLocale = DEFAULT_LOCALE): { icon: string; label: string; bucket: 'running' | 'waiting' | 'paused' | 'cooling' } {
+function stateMeta(state: TaskCenterState, locale: TelegramLocale = DEFAULT_LOCALE): { icon: string; label: string; bucket: 'running' | 'waiting' | 'paused' | 'cooling' | 'failed' } {
     switch (state) {
         case 'running': return { icon: '🟢', label: t(locale, 'taskCenter.state.running'), bucket: 'running' };
         case 'waiting': return { icon: '⏳', label: t(locale, 'taskCenter.state.waiting'), bucket: 'waiting' };
         case 'pausing': return { icon: '⏸', label: t(locale, 'taskCenter.state.pausing'), bucket: 'paused' };
         case 'paused': return { icon: '⏸', label: t(locale, 'taskCenter.state.paused'), bucket: 'paused' };
         case 'cooling': return { icon: '🧊', label: t(locale, 'taskCenter.state.cooling'), bucket: 'cooling' };
-        case 'failed': return { icon: '🔴', label: t(locale, 'taskCenter.state.failed'), bucket: 'waiting' };
+        case 'failed': return { icon: '🔴', label: t(locale, 'taskCenter.state.failed'), bucket: 'failed' };
     }
 }
 
@@ -173,7 +174,7 @@ export function buildTaskCenterPage(
     const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
     const page = Math.min(Math.max(0, Math.floor(requestedPage || 0)), totalPages - 1);
     const visibleItems = items.slice(page * pageSize, page * pageSize + pageSize);
-    const counts = { running: 0, waiting: 0, paused: 0, cooling: 0 };
+    const counts = { running: 0, waiting: 0, paused: 0, cooling: 0, failed: 0 };
     for (const item of items) counts[stateMeta(item.state, locale).bucket] += 1;
 
     const lines = [
@@ -181,6 +182,7 @@ export function buildTaskCenterPage(
         '',
         t(locale, 'taskCenter.summary', counts),
         ...(counts.cooling > 0 ? [t(locale, 'taskCenter.summaryCooling', { count: counts.cooling })] : []),
+        ...(counts.failed > 0 ? [t(locale, 'taskCenter.summaryFailed', { count: counts.failed })] : []),
         t(locale, totalPages > 1 ? 'taskCenter.totalPaged' : 'taskCenter.total', { count: items.length, page: page + 1, totalPages }),
     ];
     if (visibleItems.length === 0) {
@@ -228,6 +230,7 @@ export function buildTaskCenterDetail(
         t(locale, 'taskCenter.detail.type', { value: kindLabel(item.kind, locale) }),
         ...(source ? [t(locale, 'taskCenter.detail.source', { value: markdownText(source) })] : []),
         t(locale, 'taskCenter.detail.progress', { value: markdownText(progressLine(item, locale)) }),
+        ...(item.scanProgressText ? [item.scanProgressText] : []),
         ...(currentFileName ? [t(locale, 'taskCenter.detail.currentFile', { value: markdownText(currentFileName) })] : []),
         ...(targetFolder ? [t(locale, 'taskCenter.detail.targetFolder', { value: markdownText(targetFolder) })] : []),
         ...(reason ? [t(locale, 'taskCenter.detail.reason', { value: markdownText(reason) })] : []),
@@ -255,8 +258,9 @@ export function buildTaskCenterDetail(
     const actionRow: TaskCenterButton[] = [];
     if (item.state === 'waiting' && (item.sourceType === 'memory' || item.active + item.pending > 0)) actionRow.push({ text: t(locale, 'taskCenter.button.start'), data: callbackAction('start', item, page) });
     if (item.state === 'running') actionRow.push({ text: t(locale, 'taskCenter.button.pause'), data: callbackAction('pause', item, page) });
-    if (item.state === 'paused' && !systemBlocked) actionRow.push({ text: t(locale, 'taskCenter.button.resume'), data: callbackAction('resume', item, page) });
+    if (item.state === 'paused') actionRow.push({ text: t(locale, 'taskCenter.button.resume'), data: callbackAction('resume', item, page) });
     if (item.state === 'pausing') actionRow.push({ text: t(locale, 'taskCenter.button.undoPause'), data: callbackAction('resume', item, page) });
+    if (item.state === 'failed' && item.sourceType === 'channel') actionRow.push({ text: t(locale, 'taskCenter.button.retry'), data: callbackAction('retry', item, page) });
     actionRow.push({ text: t(locale, 'taskCenter.button.cancel'), data: callbackAction('cancel_prompt', item, page) });
 
     return {
@@ -299,14 +303,14 @@ export function parseTaskCenterCallback(data: string): ParsedTaskCenterCallback 
     let match = data.match(/^tc_l_(\d{1,6})$/);
     if (match) return { view: 'list', page: Number(match[1]) };
 
-    match = data.match(/^tc_d_([mc])_([A-Za-z0-9-]{1,24})_(\d{1,6})$/);
+    match = data.match(/^tc_d_([mc])_([A-Za-z0-9_-]{1,24})_(\d{1,6})$/);
     if (match) {
         const sourceType = CODE_SOURCES[match[1]];
         if (!sourceType || !VALID_ID.test(match[2])) return null;
         return { view: 'detail', sourceType, id: match[2], page: Number(match[3]) };
     }
 
-    match = data.match(/^tc_a_([sprtxk])_([mc])_([A-Za-z0-9-]{1,24})_(\d{1,6})$/);
+    match = data.match(/^tc_a_([sprtxk])_([mc])_([A-Za-z0-9_-]{1,24})_(\d{1,6})$/);
     if (!match) return null;
     const action = CODE_ACTIONS[match[1]];
     const sourceType = CODE_SOURCES[match[2]];
@@ -362,12 +366,7 @@ export function channelTaskCenterItem(row: any, locale: TelegramLocale = DEFAULT
     const rawId = String(row?.id || '').replace(/[^A-Za-z0-9-]/g, '');
     if (!rawId) return null;
     const id = rawId.slice(0, 12);
-    const total = Math.max(safeNumber(row.total_count), safeNumber(row.item_count));
-    const active = safeNumber(row.downloading_count);
-    const pending = safeNumber(row.pending_count);
-    const completed = safeNumber(row.success_count);
-    const failed = safeNumber(row.failed_count);
-    const skipped = safeNumber(row.skipped_count_items ?? row.skipped_count);
+    const { total, active, pending, completed, failed, skipped } = telegramChannelJobCounts(row);
     const cooldownUntil = row.cooldown_until ? new Date(row.cooldown_until) : undefined;
     const inCooldown = Boolean(row.cooldown_until && safeTime(row.cooldown_until, 0) > Date.now())
         || (row.status === 'cooling' && (!row.cooldown_until || safeTime(row.cooldown_until, 0) > Date.now()));
@@ -382,17 +381,17 @@ export function channelTaskCenterItem(row: any, locale: TelegramLocale = DEFAULT
         }
         : undefined;
     const channelState = telegramChannelJobTaskState(row);
-    const state: TaskCenterState = inCooldown
-        ? 'cooling'
-        : row.status === 'paused'
-            ? (active > 0 ? 'pausing' : 'paused')
+    const state: TaskCenterState = row.status === 'paused'
+        ? (active > 0 ? 'pausing' : 'paused')
+        : inCooldown
+            ? 'cooling'
             : channelState.status === 'cancelled'
                 ? 'failed'
                 : channelState.status === 'completed'
                     ? 'waiting'
                     : channelState.status === 'failed'
                         ? 'failed'
-                        : row.status === 'queued' || row.status === 'pending'
+                        : channelState.status === 'pending'
                             ? 'waiting'
                             : active > 0 || channelState.stage === 'scanning' || channelState.stage === 'downloading' || row.is_actively_running
                                 ? 'running'
@@ -415,6 +414,14 @@ export function channelTaskCenterItem(row: any, locale: TelegramLocale = DEFAULT
     const source = String(row.source || t(locale, 'taskCenter.kind.channel'));
     const chatId = row.chat_id !== undefined && row.chat_id !== null ? String(row.chat_id) : undefined;
     const userId = row.user_id !== undefined && row.user_id !== null ? safeNumber(row.user_id) : undefined;
+    const checkpoint = row.scan_cursor || {};
+    const scan = checkpoint.progress || checkpoint;
+    const scanProgressText = ['date_range', 'tag_download'].includes(String(row.kind)) ? [
+        t(locale, 'bot.legacy.channelScan', { scanned: safeNumber(scan.channelMessagesScanned), found: safeNumber(scan.channelMediaFound) }),
+        safeNumber(scan.commentMessagesScanned) > 0 || safeNumber(scan.commentMediaFound) > 0
+            ? t(locale, 'bot.legacy.commentScan', { scanned: safeNumber(scan.commentMessagesScanned), found: safeNumber(scan.commentMediaFound) }) : '',
+        scan.lastMessageDate ? t(locale, 'channelCard.scanDate', { time: formatDate(scan.lastMessageDate, locale) }) : '',
+    ].filter(Boolean).join('\n') : undefined;
     return {
         sourceType: 'channel',
         id,
@@ -434,6 +441,7 @@ export function channelTaskCenterItem(row: any, locale: TelegramLocale = DEFAULT
         targetFolder: row.folder_override || options.folderOverride || null,
         reason: protection?.reason ?? (row.status === 'paused' ? t(locale, 'taskCenter.reason.userPaused') : row.error || undefined),
         protection,
+        scanProgressText,
         createdAt: safeTime(row.created_at),
         updatedAt: safeTime(row.queue_updated_at || row.updated_at),
     };
