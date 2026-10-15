@@ -15,7 +15,9 @@ services:
         - SOURCE_VERSION=${SOURCE_VERSION:-worktree}
     container_name: tg-vault-frontend
     ports:
-      - "127.0.0.1:47832:80"
+      # 默认只监听回环，由宿主机 Nginx 反代。
+      # 要用 http://IP:端口 直连时，在 .env 里设 WEB_BIND=0.0.0.0。
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-47832}:80"
     networks:
       - tg-vault-network
     depends_on:
