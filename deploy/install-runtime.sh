@@ -6,6 +6,37 @@ installer_compose() {
 
 prepare_install_compose() {
   INSTALL_COMPOSE_ARGS=()
+  if [[ "${INSTALL_IMAGE_MODE:-false}" == true ]]; then
+    # 拉取 CI 产出的镜像：compose 不再需要 build 段（--image 用的镜像同样带 SBOM/provenance）。
+    if [[ -n "${COMPOSE_FILE:-}" || -f compose.override.yaml || -f compose.override.yml || -f docker-compose.override.yml || -f docker-compose.override.yaml ]]; then
+      echo "镜像模式不支持额外 Compose 文件；请升级工具链或去掉额外覆盖文件。" >&2
+      return 1
+    fi
+    INSTALL_COMPAT_FILE="$(mktemp "${TMPDIR:-/tmp}/tg-vault-compose-image.XXXXXX.yml")"
+    trap 'rm -f "${INSTALL_COMPAT_FILE:-}"' EXIT
+    python3 - "$PWD/docker-compose.yml" "$INSTALL_COMPAT_FILE" <<'PY'
+from pathlib import Path
+import sys
+
+source, target = map(Path, sys.argv[1:])
+lines = source.read_text().splitlines(keepends=True)
+out = []
+skip_build = False
+for line in lines:
+    stripped = line.strip()
+    if stripped and not line.lstrip().startswith('#'):
+        indent = len(line) - len(line.lstrip())
+        if indent <= 4:
+            skip_build = stripped == 'build:'
+        if skip_build:
+            continue
+    out.append(line)
+target.write_text(''.join(out))
+PY
+    INSTALL_COMPOSE_ARGS=(--project-directory "$PWD" --env-file "$PWD/.env" -f "$INSTALL_COMPAT_FILE")
+    echo "镜像模式：已忽略 docker-compose.yml 的 build 段，直接使用仓库里拉取的镜像。"
+    return 0
+  fi
   [[ "${INSTALL_REQUIRE_ATTESTATIONS:-true}" == false ]] || return 0
   if [[ -n "${COMPOSE_FILE:-}" || -f compose.override.yaml || -f compose.override.yml || -f docker-compose.override.yml || -f docker-compose.override.yaml ]]; then
     echo "兼容模式不支持额外 Compose 文件；请升级工具链并使用标准模式保留自定义配置。" >&2
@@ -76,10 +107,16 @@ start_installation() {
   installer_compose config --quiet
   installer_compose config --format json | python3 "$SCRIPT_DIR/install-storage.py" verify
   # Separate builds bound peak RAM on small servers.
-  INSTALL_STAGE=build-backend
-  installer_compose build backend
-  INSTALL_STAGE=build-frontend
-  installer_compose build frontend
+  # 镜像模式不本地构建，只拉取 CI 已构建并附 SBOM/provenance 的镜像。
+  if [[ "${INSTALL_IMAGE_MODE:-false}" == true ]]; then
+    INSTALL_STAGE=pull
+    installer_compose pull
+  else
+    INSTALL_STAGE=build-backend
+    installer_compose build backend
+    INSTALL_STAGE=build-frontend
+    installer_compose build frontend
+  fi
   INSTALL_STAGE=postgres
   # The first install MUST start its dependency. Existing database containers are
   # never recreated for an application upgrade; stopped ones may be started.

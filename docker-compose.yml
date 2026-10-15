@@ -3,7 +3,8 @@ name: tg-vault
 services:
   # 前端（暴露到宿主机供 Nginx 反代）
   frontend:
-    image: tg-vault-frontend:${IMAGE_VERSION:-source}
+    # 默认本地构建镜像；用 deploy/install.sh --image 或直接设置该变量可改用仓库里拉取的镜像。
+    image: ${TG_VAULT_FRONTEND_IMAGE:-tg-vault-frontend:${IMAGE_VERSION:-source}}
     build:
       context: ./frontend
       sbom: true
@@ -35,7 +36,7 @@ services:
 
   # 后端（暴露到宿主机供 Nginx 反代）
   backend:
-    image: tg-vault-backend:${IMAGE_VERSION:-source}
+    image: ${TG_VAULT_BACKEND_IMAGE:-tg-vault-backend:${IMAGE_VERSION:-source}}
     build:
       context: ./backend
       sbom: true
@@ -77,7 +78,9 @@ services:
       - AUTO_CLEANUP_ORPHANS=${AUTO_CLEANUP_ORPHANS:-true}
       - ORPHAN_CLEANUP_MIN_AGE_MS=${ORPHAN_CLEANUP_MIN_AGE_MS:-600000}
       - CORS_ORIGIN=${CORS_ORIGIN:-https://cloud.example.com}
-      - OAUTH_CALLBACK_BASE_URL=${OAUTH_CALLBACK_BASE_URL:-${VITE_API_URL:-https://api.example.com}}
+      # 留空时后端按 OAUTH_CALLBACK_BASE_URL -> VITE_API_URL -> CORS_ORIGIN 顺序推导。
+      # 不要回退到示例域名，否则单域名部署会把回调指到不存在的地址。
+      - OAUTH_CALLBACK_BASE_URL=${OAUTH_CALLBACK_BASE_URL:-${VITE_API_URL:-}}
       - OAUTH_FRONTEND_ORIGIN=${OAUTH_FRONTEND_ORIGIN:-${CORS_ORIGIN:-https://cloud.example.com}}
       - SESSION_SECRET=${SESSION_SECRET:-}
       - STORAGE_CREDENTIALS_SECRET=${STORAGE_CREDENTIALS_SECRET:-}

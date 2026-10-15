@@ -1,0 +1,8 @@
+# Shell 脚本、Compose 与 CI 配置会被 Linux 服务器直接执行。
+# CRLF 会让 `#!/usr/bin/env bash` 变成 `bash\r`，导致 "command not found"。
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.py text eol=lf
+*.sql text eol=lf
+*.json text eol=lf

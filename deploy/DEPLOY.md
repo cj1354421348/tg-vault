@@ -24,14 +24,20 @@ TG Vault 使用 **Docker Compose + 宿主机反向代理**。Compose 包含 `pos
 ./deploy/install.sh
 ```
 
-首次运行只需要填写以下 2 项：
+首次运行只需填写 Web 访问地址；API 地址可以留空：
 
 ```dotenv
-VITE_API_URL=https://api.example.com
+# 浏览器里访问的地址（必填）
 CORS_ORIGIN=https://cloud.example.com
+# 留空 = 与 Web 同域，由前端容器内的 Nginx 把 /api 转发给后端
+VITE_API_URL=
 ```
 
-填写实际 HTTPS origin（协议、域名及可选端口），不带路径、查询参数或末尾 `/`。域名后缀不限，例如 `.cc`、`.cn` 或多级子域名均可；裸域名无效。HTTP 仅适用于本地调试，默认安全 Cookie 需要 HTTPS。
+地址只写协议 + 主机 + 可选端口，不带路径、查询参数或末尾 `/`。域名后缀不限，例如 `.cc`、`.cn` 或多级子域名均可；裸域名无效。
+
+**IP:端口部署**：`CORS_ORIGIN` 也支持 `http://192.168.1.10:47832` 这类写法，此时安装器会自动把 `COOKIE_SECURE` 与 `COOKIE_SECURE_FORCE` 写为 `false`（否则浏览器会丢弃会话 Cookie，表现为登录成功但立刻跳回登录页）。HTTP 为明文传输，仅建议内网或临时使用；公网请配 HTTPS，用 HTTPS 时这两个值会自动为 `true`。
+
+**单域名（推荐）**：`VITE_API_URL` 留空，宿主机反向代理只指向 `http://127.0.0.1:47832`。前端容器内的 Nginx 已经把 `/api`、`/uploads`、`/thumbnails` 转发给 `backend:51947`，因此单域名天然满足 CSP `connect-src 'self'` 与 `SameSite=Lax`，不需要额外证书和 CORS 配置。只有 API 确实单独占一个域名/端口时才填 `VITE_API_URL`。
 
 没有已有地址时，按 Enter 不会使用示例。如果已复制 `.env.example`，或在环境变量中设置了示例地址，必须主动替换，否则 Enter 会保留占位值。安装器不替换 Nginx 配置中的域名。确认页面按 Enter 保存并部署，输入 `e` 重填，输入 `q` 取消。
 
@@ -49,7 +55,7 @@ STORAGE_CREDENTIALS_SECRET=随机生成的64位十六进制密钥
 
 升级时，若 `.env` 未设置 `SESSION_SECRET` 或 `STORAGE_CREDENTIALS_SECRET`，继续使用 `/data/secrets` 中已有的持久密钥，不生成替代值，以免 2FA 和存储凭证失效。
 
-OAuth 默认使用 `VITE_API_URL` 作为回调来源，并使用 `CORS_ORIGIN` 的第一个地址作为前端通知来源。只有多入口或特殊反代部署才需显式设置 `OAUTH_CALLBACK_BASE_URL`、`OAUTH_FRONTEND_ORIGIN`。
+OAuth 回调地址按 `OAUTH_CALLBACK_BASE_URL` → `VITE_API_URL` → `CORS_ORIGIN` 顺序推导，前端通知来源按 `OAUTH_FRONTEND_ORIGIN` → `CORS_ORIGIN` 推导。单域名部署无需填写；只有多入口或特殊反代部署才需显式设置。
 
 直接运行 Compose 时，需自行生成新部署的 `DB_PASSWORD`，已有数据库必须使用原密码；镜像名称会使用 `source`，源码修订号和版本元数据回退为 `unknown` / `worktree`。
 
@@ -81,10 +87,21 @@ docker compose ps
 
 ## 4. 配置宿主机反向代理
 
-按实际域名配置宿主机 Nginx 或其他反向代理：
+**单域名（推荐）**：宿主机反向代理只转发一个地址：
+
+- `https://<你的域名>` → `http://127.0.0.1:47832`（`/api` 已由前端容器内部转发给后端）
+
+此时 API 域名无需配置，也不需要额外的 TLS 证书或 CORS 设置。记得透传 `X-Forwarded-For`、`X-Forwarded-Proto`、`Host`，否则限流会把所有客户端当成同一个 IP，登录通知里的 IP 也会失真。
+
+**双域名（仅在确实需要时）**：
 
 - Web 域名代理至 `http://127.0.0.1:47832`
 - API 域名代理至 `http://127.0.0.1:51947`
+
+双域名需要同时处理三件事：API 域名要单独签证书；前端容器的 CSP 里 `connect-src` 目前是 `'self'`，跨域 API 会被拦截；会话 Cookie 是 `SameSite=Lax`，跨站请求不带 Cookie。除非有明确需求，否则不要选这条路径。
+
+**IP:端口直连**：Compose 默认把端口绑在 `127.0.0.1`（只允许本机反代）。要直接用 `http://<服务器IP>:47832` 访问，需要把 `docker-compose.yml` 里 frontend 的 `127.0.0.1:47832:80` 改成 `47832:80`；这会把服务暴露到所有网卡，请自行确认防火墙。
+
 - API 上传链路的 `client_max_body_size` 必须与应用的请求/分片限制匹配；它限制单次 HTTP 请求，不是文件总大小
 - TLS 证书由宿主机 Nginx/面板/Certbot 管理，不要运行 `docker compose run certbot`
 
